@@ -1,0 +1,697 @@
+# meta developer: @dubstep_namaz1337
+# meta banner: https://i.imgur.com/7QZ8Z9Q.png
+
+"""
+Модуль для поиска изображений и видео на Rule34.
+
+Это порт плагина с exteraGram для Heroku UserBot.
+
+Оригинальные разработчики: @ArThirtyFour | @KangelPlugins
+Портировал: @dubstep_namaz1337
+
+Использование:
+- .r34 [теги] [кол-во] - поиск на Rule34
+- .updateproxy - обновить список прокси
+- .testr34 [тег] - тест API
+"""
+
+import random
+import requests
+import asyncio
+import json
+import os
+import time
+import threading
+import concurrent.futures
+import xml.etree.ElementTree as ET
+from typing import List, Dict, Optional, Tuple
+from herokutl.types import Message
+from .. import loader, utils
+
+# User-Agent список для ротации
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+]
+
+def get_random_user_agent() -> str:
+    """Получить случайный User-Agent"""
+    return random.choice(USER_AGENTS)
+
+
+def normalize_proxy_url(raw: str) -> Optional[str]:
+    """Нормализация URL прокси"""
+    try:
+        if raw is None:
+            return None
+        s = str(raw).strip()
+        if not s:
+            return None
+
+        if s.startswith("http://") or s.startswith("https://") or s.startswith("socks4://") or s.startswith("socks5://"):
+            return s
+
+        parts = s.split(":")
+        if len(parts) == 2:
+            host, port = parts
+            if host and port:
+                return f"http://{host}:{port}"
+            return None
+
+        if len(parts) == 4:
+            host, port, user, pwd = parts
+            if host and port and user and pwd:
+                return f"http://{user}:{pwd}@{host}:{port}"
+            return None
+
+        return None
+    except Exception:
+        return None
+
+
+def build_requests_proxies(proxy_url: Optional[str]) -> Optional[dict]:
+    """Построить словарь прокси для requests"""
+    p = normalize_proxy_url(proxy_url)
+    if not p:
+        return None
+    return {"http": p, "https": p}
+
+
+def check_single_proxy(proxy: str) -> Tuple[str, bool, float]:
+    """Проверить один прокси"""
+    start_time = time.time()
+    
+    try:
+        proxy_dict = build_requests_proxies(proxy)
+        if not proxy_dict:
+            return proxy, False, 0
+        
+        response = requests.get(
+            "https://yande.re",
+            proxies=proxy_dict,
+            timeout=3
+        )
+        
+        if response.status_code == 200:
+            response_time = time.time() - start_time
+            return proxy, True, response_time
+        else:
+            return proxy, False, 0
+            
+    except Exception:
+        return proxy, False, 0
+
+
+def check_proxies_parallel(proxies: List[str], max_workers: int = 50, max_working: int = 20) -> List[Dict]:
+    """Проверить прокси параллельно"""
+    working_proxies = []
+    working_proxies_lock = threading.Lock()
+    stop_search = threading.Event()
+    
+    def check_proxy_wrapper(proxy):
+        if stop_search.is_set():
+            return proxy, False, 0
+            
+        proxy, is_working, response_time = check_single_proxy(proxy)
+        
+        if is_working:
+            with working_proxies_lock:
+                working_proxies.append({
+                    "proxy": proxy,
+                    "response_time": response_time
+                })
+                
+                if len(working_proxies) >= max_working:
+                    stop_search.set()
+        
+        return proxy, is_working, response_time
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_proxy = {executor.submit(check_proxy_wrapper, proxy): proxy for proxy in proxies}
+        
+        for future in concurrent.futures.as_completed(future_to_proxy):
+            if stop_search.is_set():
+                for f in future_to_proxy:
+                    f.cancel()
+                break
+    
+    return working_proxies
+
+
+def get_request_headers(rotate_ua: bool = True) -> dict:
+    """Получить заголовки для запроса"""
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    
+    if rotate_ua:
+        headers["User-Agent"] = get_random_user_agent()
+    else:
+        headers["User-Agent"] = USER_AGENTS[0]
+    
+    return headers
+
+
+def localise(key: str, lang: str = "ru") -> str:
+    """Локализация строк"""
+    locales = {
+        "ru": {
+            "not_found": "Ничего не найдено!",
+            "not_found_filtered": "Ничего не найдено после фильтрации!",
+            "request_error": "Ошибка при запросе: {e}",
+            "xml_parse_error": "Ошибка при парсинге XML.",
+            "general_data_error": "Произошла общая ошибка при получении данных: {e}",
+            "unknown_site": "Неизвестный сайт для поиска.",
+            "no_args": "Нет аргументов!",
+            "usage": "Использование: .r34 [теги] [кол-во]\nПример: .r34 anime 2",
+            "searching": "Ищем...",
+            "post_found_header": "🔞 *Найден пост!*\n\n",
+            "requested_tags_line": "🔍 *Запрошенные теги:* `{requested_tags_str}`\n\n",
+            "post_tags_line": "🏷️ *Теги в посте:* `{post_tags}`\n\n",
+            "rating_line": "🔞 *Рейтинг:* `{rating}`\n\n",
+            "image_link_line": "🔗 *Ссылка:* [Открыть изображение]({image_url})",
+            "site_blocked_rule34": "Rule34.xxx заблокирован! Включите VPN.",
+            "site_blocked_yandere": "Yande.re заблокирован! Включите VPN.",
+        },
+        "en": {
+            "not_found": "Nothing found!",
+            "not_found_filtered": "Nothing found after filtering!",
+            "request_error": "Request error: {e}",
+            "xml_parse_error": "XML parse error.",
+            "general_data_error": "An error occurred while fetching data: {e}",
+            "unknown_site": "Unknown search site.",
+            "no_args": "No arguments!",
+            "usage": "Usage: .r34 [tags] [count]\nExample: .r34 anime 2",
+            "searching": "Searching...",
+            "post_found_header": "🔞 *Post found!*\n\n",
+            "requested_tags_line": "🔍 *Requested tags:* `{requested_tags_str}`\n\n",
+            "post_tags_line": "🏷️ *Tags in post:* `{post_tags}`\n\n",
+            "rating_line": "🔞 *Rating:* `{rating}`\n\n",
+            "image_link_line": "🔗 *Link:* [Open image]({image_url})",
+            "site_blocked_rule34": "Rule34.xxx is blocked! Enable VPN.",
+            "site_blocked_yandere": "Yande.re is blocked! Enable VPN.",
+        }
+    }
+    return locales.get(lang, locales["en"]).get(key, key)
+
+
+@loader.tds
+class Rule34Searcher(loader.Module):
+    """Поиск изображений и видео на Rule34"""
+    
+    strings = {
+        "name": "Rule34Searcher",
+        "not_found": "Ничего не найдено!",
+        "searching": "Ищем...",
+        "error": "Ошибка: {}",
+        "usage_r34": "Использование: .r34 [теги] [кол-во]\nПример: .r34 anime 2",
+        "proxy_update_started": "Обновление прокси началось...",
+        "proxy_update_success": "Список прокси обновлен! Найдено {} рабочих прокси",
+        "proxy_update_error": "Ошибка при обновлении прокси: {}",
+    }
+    
+    strings_en = {
+        "not_found": "Nothing found!",
+        "searching": "Searching...",
+        "error": "Error: {}",
+        "usage_r34": "Usage: .r34 [tags] [count]\nExample: .r34 anime 2",
+        "proxy_update_started": "Proxy update started...",
+        "proxy_update_success": "Proxy list updated! Found {} working proxies",
+        "proxy_update_error": "Proxy update error: {}",
+    }
+
+    def __init__(self):
+        self.config = loader.ModuleConfig(
+            loader.ConfigValue(
+                "tags_in",
+                "",
+                "Теги для включения (через пробел)",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "tags_ex",
+                "",
+                "Теги для исключения (через ;)",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "antiai",
+                False,
+                "Фильтр AI-контента",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "posts_count",
+                100,
+                "Количество постов для поиска (макс: 1000)",
+                validator=loader.validators.Integer(minimum=1, maximum=1000),
+            ),
+            loader.ConfigValue(
+                "send_count",
+                1,
+                "Сколько постов отправлять (макс: 10)",
+                validator=loader.validators.Integer(minimum=1, maximum=10),
+            ),
+            loader.ConfigValue(
+                "show_requested_tags",
+                True,
+                "Показывать запрошенные теги",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "show_post_tags",
+                True,
+                "Показывать теги поста",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "show_image_link",
+                True,
+                "Показывать ссылку на изображение",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "show_rating",
+                True,
+                "Показывать рейтинг",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "use_proxy",
+                False,
+                "Использовать прокси",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "proxy_rotate",
+                True,
+                "Ротировать прокси",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "proxy_rotate_ua",
+                True,
+                "Ротировать User-Agent",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "proxy_source",
+                "builtin",
+                "Источник прокси (builtin/url/manual)",
+                validator=loader.validators.Choice(["builtin", "url", "manual"]),
+            ),
+            loader.ConfigValue(
+                "proxy_source_url",
+                "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.txt",
+                "URL списка прокси",
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "proxy_manual_list",
+                "",
+                "Ручной список прокси (ip:port, по одному на строку)",
+                validator=loader.validators.String(),
+            ),
+        )
+        self._cache = {}
+        self._working_proxies = []
+        self._proxy_file = "booru_proxies.json"
+
+    def _save_proxies(self):
+        """Сохранить рабочие прокси в файл"""
+        try:
+            proxy_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                self._proxy_file
+            )
+            with open(proxy_path, 'w', encoding='utf-8') as f:
+                json.dump(self._working_proxies, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _load_proxies(self):
+        """Загрузить рабочие прокси из файла"""
+        try:
+            proxy_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                self._proxy_file
+            )
+            if os.path.exists(proxy_path):
+                with open(proxy_path, 'r', encoding='utf-8') as f:
+                    self._working_proxies = json.load(f)
+        except Exception:
+            self._working_proxies = []
+
+    def _get_working_proxy(self, test_url: str = "https://api.rule34.xxx/") -> Optional[dict]:
+        """Получить рабочий прокси"""
+        try:
+            if not self._working_proxies:
+                self._load_proxies()
+            
+            if self._working_proxies:
+                random.shuffle(self._working_proxies)
+                
+                for proxy_info in self._working_proxies[:5]:
+                    proxy = proxy_info['proxy']
+                    proxy_dict = build_requests_proxies(proxy)
+                    if not proxy_dict:
+                        continue
+                    headers = get_request_headers(self.config["proxy_rotate_ua"])
+                    
+                    try:
+                        test_response = requests.get(test_url, proxies=proxy_dict, headers=headers, timeout=5)
+                        if test_response.status_code == 200:
+                            return proxy_dict
+                    except Exception:
+                        continue
+            
+            return None
+            
+        except Exception:
+            return None
+
+    async def _update_proxy_list(self):
+        """Обновить список прокси"""
+        def update_proxies_background():
+            try:
+                proxy_source = self.config["proxy_source"]
+                proxies = []
+                
+                if proxy_source == "url":
+                    url = self.config["proxy_source_url"]
+                    response = requests.get(url, timeout=10)
+                    response.raise_for_status()
+                    raw_proxies = [line.strip() for line in response.text.split('\n') if line.strip()]
+                    for proxy in raw_proxies:
+                        norm = normalize_proxy_url(proxy)
+                        if norm:
+                            proxies.append(norm)
+                
+                elif proxy_source == "manual":
+                    manual_list = self.config["proxy_manual_list"]
+                    raw_proxies = [line.strip() for line in manual_list.split('\n') if line.strip()]
+                    for proxy in raw_proxies:
+                        norm = normalize_proxy_url(proxy)
+                        if norm:
+                            proxies.append(norm)
+                
+                if proxies:
+                    working = check_proxies_parallel(proxies, max_workers=50, max_working=20)
+                    self._working_proxies = working
+                    self._save_proxies()
+                    return len(working)
+                
+                return 0
+            except Exception as e:
+                raise e
+        
+        try:
+            count = await utils.run_sync(update_proxies_background)
+            return count
+        except Exception as e:
+            raise e
+
+    async def _make_request(self, url: str, params: dict = None, use_proxy: bool = False) -> Optional[requests.Response]:
+        """Выполнить HTTP запрос с поддержкой прокси"""
+        def _request():
+            headers = get_request_headers(self.config["proxy_rotate_ua"])
+            
+            # Сначала пробуем без прокси
+            try:
+                response = requests.get(url, params=params, headers=headers, timeout=5)
+                response.raise_for_status()
+                return response
+            except Exception:
+                # Если не удалось и включены прокси
+                if use_proxy and self.config["use_proxy"]:
+                    proxy_dict = self._get_working_proxy(url)
+                    if proxy_dict:
+                        response = requests.get(url, params=params, headers=headers, proxies=proxy_dict, timeout=10)
+                        response.raise_for_status()
+                        return response
+                    else:
+                        # Пробуем еще раз без прокси
+                        response = requests.get(url, params=params, headers=headers, timeout=10)
+                        response.raise_for_status()
+                        return response
+                else:
+                    # Пробуем еще раз без прокси
+                    response = requests.get(url, params=params, headers=headers, timeout=10)
+                    response.raise_for_status()
+                    return response
+        
+        try:
+            return await utils.run_sync(_request)
+        except Exception:
+            return None
+
+    async def _search_rule34(self, tags: str, limit: int = 100) -> List[Dict]:
+        """Поиск на Rule34 с полной поддержкой прокси и API"""
+        # Добавляем теги из конфига
+        tags_in_setting = self.config["tags_in"]
+        tags_ex_setting = self.config["tags_ex"]
+        antiai = self.config["antiai"]
+        
+        # Парсим теги из запроса
+        query_parts = tags.split()
+        include_tags = []
+        exclude_tags = []
+        
+        for part in query_parts:
+            if part.startswith('-'):
+                exclude_tags.append(part[1:])
+            else:
+                include_tags.append(part)
+        
+        # Строим поисковый запрос
+        search_tags = f"{tags_in_setting} {' '.join(include_tags)}".strip()
+        
+        # Добавляем исключающие теги
+        all_exclude_tags = tags_ex_setting.split("; ") + exclude_tags
+        tags_ex = [tag.strip() for tag in all_exclude_tags if tag.strip()]
+        
+        # Добавляем анти-AI теги
+        if antiai:
+            anti_ai_tags = ['-ai_generated', '-stable_diffusion', '-midjourney', '-artificial_intelligence', 
+                          '-neural_network', '-machine_learning', '-deepfake', '-ai_art', '-ai-generated', 
+                          '-generated_by_ai', '-dall_e', '-dalle', '-novelai', '-waifu_diffusion']
+            search_tags += ' ' + ' '.join(anti_ai_tags)
+        
+        # Добавляем исключающие теги в запрос
+        if tags_ex:
+            exclude_tags_api = ['-' + tag for tag in tags_ex]
+            search_tags += ' ' + ' '.join(exclude_tags_api)
+        
+        # Параметры запроса с API ключом (БЕЗ json=1, чтобы получить XML)
+        url = "https://api.rule34.xxx/index.php"
+        params = {
+            'page': 'dapi',
+            's': 'post',
+            'q': 'index',
+            'limit': limit,
+            'tags': search_tags,
+            'api_key': 'd82f6db279ce94313e629e791533d456a4309dfeb528ddab6eee4b7472156f0def07ebfd3e64b9dddbf0d3b78f227ba8a5f386533ef1ccb1377d8a97481811dc',
+            'user_id': '5255009'
+        }
+        
+        response = await self._make_request(url, params, use_proxy=True)
+        if not response:
+            return []
+        
+        try:
+            # Парсим XML ответ
+            root = ET.fromstring(response.text)
+            posts = []
+            
+            for post in root.findall("post"):
+                # Получаем URL изображения
+                image_url = post.get('file_url') or post.get('sample_url')
+                
+                if not image_url:
+                    continue
+                
+                # Парсим теги
+                tags_str = post.get('tags', '')
+                tags_list = tags_str.split() if tags_str else []
+                
+                posts.append({
+                    "file_url": image_url,
+                    "tags": tags_list,
+                    "rating": post.get("rating", ""),
+                    "id": post.get("id", ""),
+                })
+            
+            return posts
+        except Exception as e:
+            # Логируем ошибку для отладки
+            print(f"[Rule34Searcher] Error parsing Rule34 response: {e}")
+            return []
+
+    def _format_caption(self, post: Dict, requested_tags: str) -> str:
+        """Форматирование подписи к посту"""
+        caption = "🔞 <b>Найден пост!</b>\n\n"
+        
+        if self.config["show_requested_tags"] and requested_tags:
+            caption += f"🔍 <b>Запрошенные теги:</b> <code>{requested_tags}</code>\n\n"
+        
+        if self.config["show_post_tags"] and post.get("tags"):
+            tags_list = post["tags"]
+            if isinstance(tags_list, list):
+                tags = ' '.join(tags_list)
+            else:
+                tags = str(tags_list)
+            tags = tags[:200] + "..." if len(tags) > 200 else tags
+            caption += f"🏷️ <b>Теги в посте:</b> <code>{tags}</code>\n\n"
+        
+        if self.config["show_rating"] and post.get("rating"):
+            rating_map = {"s": "Safe", "q": "Questionable", "e": "Explicit", "g": "General"}
+            rating = rating_map.get(post["rating"].lower(), post["rating"])
+            caption += f"🔞 <b>Рейтинг:</b> <code>{rating}</code>\n\n"
+        
+        if self.config["show_image_link"] and post.get("file_url"):
+            caption += f'🔗 <b>Ссылка:</b> <a href="{post["file_url"]}">Открыть изображение</a>'
+        
+        return caption
+
+    async def _send_posts(self, message: Message, posts: List[Dict], requested_tags: str, count: int):
+        """Отправка постов (изображения и видео)"""
+        if not posts:
+            await utils.answer(message, self.strings["not_found"])
+            return
+        
+        selected_posts = random.sample(posts, min(count, len(posts)))
+        
+        sent_count = 0
+        for post in selected_posts:
+            file_url = post.get("file_url")
+            if not file_url:
+                continue
+            
+            caption = self._format_caption(post, requested_tags)
+            
+            try:
+                # Определяем тип файла по расширению
+                file_ext = file_url.lower().split('?')[0].split('.')[-1]
+                is_video = file_ext in ['mp4', 'webm', 'gif', 'mov', 'avi', 'mkv']
+                
+                # Отправляем файл
+                await message.client.send_file(
+                    message.peer_id,
+                    file_url,
+                    caption=caption,
+                    parse_mode="html",
+                    reply_to=getattr(message, "reply_to_msg_id", None),
+                    supports_streaming=is_video,  # Для видео включаем стриминг
+                )
+                sent_count += 1
+            except Exception as e:
+                # Если не удалось отправить, пробуем следующий пост
+                print(f"[Rule34Searcher] Error sending file: {e}")
+                continue
+        
+        if sent_count == 0:
+            await utils.answer(message, f"❌ Не удалось отправить медиа. Найдено постов: {len(posts)}")
+        else:
+            await message.delete()
+
+    @loader.command(
+        ru_doc="Обновить список прокси",
+        en_doc="Update proxy list",
+    )
+    async def updateproxycmd(self, message: Message):
+        """Обновить список прокси"""
+        await utils.answer(message, self.strings["proxy_update_started"])
+        
+        try:
+            count = await self._update_proxy_list()
+            await utils.answer(message, self.strings["proxy_update_success"].format(count))
+        except Exception as e:
+            await utils.answer(message, self.strings["proxy_update_error"].format(str(e)))
+
+    @loader.command(
+        ru_doc="Тест API Rule34",
+        en_doc="Test Rule34 API",
+    )
+    async def testr34cmd(self, message: Message):
+        """[тег] - Тест API Rule34 (показывает сырой ответ)"""
+        args = utils.get_args_raw(message)
+        if not args:
+            args = "anime"
+        
+        await utils.answer(message, f"Тестируем API с тегом: {args}")
+        
+        url = "https://api.rule34.xxx/index.php"
+        params = {
+            'page': 'dapi',
+            's': 'post',
+            'q': 'index',
+            'limit': 5,
+            'tags': args,
+            'api_key': 'd82f6db279ce94313e629e791533d456a4309dfeb528ddab6eee4b7472156f0def07ebfd3e64b9dddbf0d3b78f227ba8a5f386533ef1ccb1377d8a97481811dc',
+            'user_id': '5255009'
+        }
+        
+        response = await self._make_request(url, params, use_proxy=True)
+        
+        if not response:
+            await utils.answer(message, "❌ Не удалось получить ответ от API")
+            return
+        
+        try:
+            # Парсим XML
+            root = ET.fromstring(response.text)
+            posts = root.findall("post")
+            
+            result = f"✅ Ответ получен!\n\n"
+            result += f"Формат: XML\n"
+            result += f"Количество постов: {len(posts)}\n\n"
+            
+            if posts:
+                result += f"Первый пост:\n"
+                first_post = posts[0]
+                result += f"ID: {first_post.get('id')}\n"
+                result += f"file_url: {first_post.get('file_url', 'нет')[:50]}...\n"
+                result += f"sample_url: {first_post.get('sample_url', 'нет')[:50]}...\n"
+                result += f"rating: {first_post.get('rating', 'нет')}\n"
+                tags = first_post.get('tags', '')
+                result += f"tags (первые 100 символов): {tags[:100]}...\n"
+            
+            await utils.answer(message, result)
+        except Exception as e:
+            await utils.answer(message, f"❌ Ошибка парсинга: {e}\n\nСырой ответ (первые 500 символов):\n{response.text[:500]}")
+
+    @loader.command(
+        ru_doc="Поиск на Rule34",
+        en_doc="Search on Rule34",
+    )
+    async def r34cmd(self, message: Message):
+        """[теги] [кол-во] - Поиск на Rule34"""
+        args = utils.get_args_raw(message)
+        if not args:
+            await utils.answer(message, self.strings["usage_r34"])
+            return
+        
+        parts = args.rsplit(maxsplit=1)
+        count = self.config["send_count"]
+        
+        if len(parts) == 2 and parts[1].isdigit():
+            tags = parts[0]
+            count = min(int(parts[1]), 10)
+        else:
+            tags = args
+        
+        await utils.answer(message, self.strings["searching"])
+        
+        posts = await self._search_rule34(tags, self.config["posts_count"])
+        
+        # API уже обработал фильтрацию, не нужно дополнительно фильтровать
+        await self._send_posts(message, posts, tags, count)
+
+
