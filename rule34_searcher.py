@@ -13,6 +13,17 @@
 - .r34 [теги] [кол-во] - поиск на Rule34
 - .updateproxy - обновить список прокси
 - .testr34 [тег] - тест API
+
+Триггер-слова (автоматический поиск):
+- "фута" - поиск по тегу futa (картинки)
+- "фембой" - поиск по тегу femboy (картинки)
+- "порно" - случайное видео с Rule34
+
+Настройки в конфиге:
+- triggers_enabled - включить/выключить триггер-слова (по умолчанию: True)
+- spam_protection - защита от спама (по умолчанию: True)
+- auto_delete - автоудаление отправленных медиа (по умолчанию: True)
+- auto_delete_delay - задержка перед удалением в секундах (по умолчанию: 30)
 """
 
 import random
@@ -25,6 +36,7 @@ import threading
 import concurrent.futures
 import xml.etree.ElementTree as ET
 from typing import List, Dict, Optional, Tuple
+from collections import defaultdict, deque
 from herokutl.types import Message
 from .. import loader, utils
 
@@ -319,10 +331,54 @@ class Rule34Searcher(loader.Module):
                 "Ручной список прокси (ip:port, по одному на строку)",
                 validator=loader.validators.String(),
             ),
+            loader.ConfigValue(
+                "triggers_enabled",
+                True,
+                "Включить триггер-слова",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "spam_protection",
+                True,
+                "Включить анти-спам защиту",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "auto_delete",
+                True,
+                "Автоматически удалять отправленное медиа",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "auto_delete_delay",
+                30,
+                "Задержка в секундах перед автоудалением (0 для отключения)",
+                validator=loader.validators.Integer(minimum=0),
+            ),
         )
         self._cache = {}
         self._working_proxies = []
         self._proxy_file = "booru_proxies.json"
+        
+        # Анти-спам система
+        self._spam_events = defaultdict(deque)
+        self._chat_spam_events = defaultdict(deque)
+        self._spam_blocks = {}
+        self._chat_spam_blocks = {}
+        self._spam_lock = asyncio.Lock()
+        
+        self.SPAM_LIMIT = 3
+        self.SPAM_WINDOW = 3
+        self.BLOCK_DURATION = 15
+        self.GLOBAL_LIMIT = 10
+        self.GLOBAL_WINDOW = 10
+        
+        # Триггер-слова
+        self.triggers = {
+            "фута": "futa",
+            "фембой": "femboy",
+            "порно": "video"  # специальный маркер для видео
+        }
 
     def _save_proxies(self):
         """Сохранить рабочие прокси в файл"""
@@ -569,6 +625,7 @@ class Rule34Searcher(loader.Module):
         selected_posts = random.sample(posts, min(count, len(posts)))
         
         sent_count = 0
+        sent_messages = []
         for post in selected_posts:
             file_url = post.get("file_url")
             if not file_url:
@@ -582,7 +639,7 @@ class Rule34Searcher(loader.Module):
                 is_video = file_ext in ['mp4', 'webm', 'gif', 'mov', 'avi', 'mkv']
                 
                 # Отправляем файл
-                await message.client.send_file(
+                sent_msg = await message.client.send_file(
                     message.peer_id,
                     file_url,
                     caption=caption,
@@ -590,6 +647,7 @@ class Rule34Searcher(loader.Module):
                     reply_to=getattr(message, "reply_to_msg_id", None),
                     supports_streaming=is_video,  # Для видео включаем стриминг
                 )
+                sent_messages.append(sent_msg)
                 sent_count += 1
             except Exception as e:
                 # Если не удалось отправить, пробуем следующий пост
@@ -600,6 +658,132 @@ class Rule34Searcher(loader.Module):
             await utils.answer(message, f"❌ Не удалось отправить медиа. Найдено постов: {len(posts)}")
         else:
             await message.delete()
+            
+            # Автоудаление если включено
+            if self.config["auto_delete"] and self.config["auto_delete_delay"] > 0:
+                await asyncio.sleep(self.config["auto_delete_delay"])
+                for msg in sent_messages:
+                    try:
+                        await msg.delete()
+                    except Exception:
+                        pass
+
+    def _prune_spam_events(self, events, current_time, window):
+        """Очистка старых событий спама"""
+        while events and current_time - events[0] > window:
+            events.popleft()
+
+    def _is_spam_blocked(self, blocks, key, current_time):
+        """Проверка блокировки спама"""
+        block_until = blocks.get(key)
+        if not block_until:
+            return False
+        if current_time < block_until:
+            return True
+        del blocks[key]
+        return False
+
+    def _spam_user_key(self, user_id, chat_id):
+        """Генерация ключа для пользователя"""
+        if user_id is None:
+            return f"unknown:{chat_id}"
+        return f"{user_id}:{chat_id}"
+
+    async def _check_spam(self, user_id, chat_id):
+        """Проверка на спам"""
+        if not self.config["spam_protection"]:
+            return False
+        
+        current_time = time.time()
+        user_key = self._spam_user_key(user_id, chat_id)
+        chat_key = str(chat_id)
+        
+        async with self._spam_lock:
+            if self._is_spam_blocked(self._chat_spam_blocks, chat_key, current_time):
+                return True
+            if self._is_spam_blocked(self._spam_blocks, user_key, current_time):
+                return True
+            
+            user_events = self._spam_events[user_key]
+            chat_events = self._chat_spam_events[chat_key]
+            
+            self._prune_spam_events(user_events, current_time, self.SPAM_WINDOW)
+            self._prune_spam_events(chat_events, current_time, self.GLOBAL_WINDOW)
+            
+            if len(user_events) >= self.SPAM_LIMIT:
+                self._spam_blocks[user_key] = current_time + self.BLOCK_DURATION
+                user_events.clear()
+                return True
+            
+            if len(chat_events) >= self.GLOBAL_LIMIT:
+                self._chat_spam_blocks[chat_key] = current_time + self.BLOCK_DURATION
+                chat_events.clear()
+                return True
+            
+            user_events.append(current_time)
+            chat_events.append(current_time)
+            return False
+
+    async def _search_and_send_by_trigger(self, message: Message, search_tag: str, video_only: bool = False):
+        """Поиск и отправка по триггеру"""
+        # Проверка на спам
+        user_id = message.sender_id
+        chat_id = message.peer_id
+        
+        if await self._check_spam(user_id, chat_id):
+            return
+        
+        # Поиск постов
+        posts = await self._search_rule34(search_tag, self.config["posts_count"])
+        
+        # Фильтрация только видео если нужно
+        if video_only and posts:
+            video_posts = []
+            for post in posts:
+                file_url = post.get("file_url", "")
+                file_ext = file_url.lower().split('?')[0].split('.')[-1]
+                if file_ext in ['mp4', 'webm', 'mov', 'avi', 'mkv']:
+                    video_posts.append(post)
+            posts = video_posts
+        
+        if not posts:
+            return
+        
+        # Отправка одного поста
+        await self._send_posts(message, posts, search_tag, 1)
+
+    @loader.watcher()
+    async def watcher(self, message: Message):
+        """Отслеживание триггер-слов"""
+        try:
+            if not self.config["triggers_enabled"]:
+                return
+            
+            if not message.text:
+                return
+            
+            # Игнорируем команды
+            if message.text.startswith("."):
+                return
+            
+            # Игнорируем свои сообщения
+            if message.out:
+                return
+            
+            text_lower = message.text.lower()
+            
+            # Проверяем триггер-слова
+            for trigger_word, search_tag in self.triggers.items():
+                if trigger_word in text_lower:
+                    if search_tag == "video":
+                        # Для "порно" ищем любой контент но только видео
+                        await self._search_and_send_by_trigger(message, "", video_only=True)
+                    else:
+                        # Для остальных ищем по тегу
+                        await self._search_and_send_by_trigger(message, search_tag, video_only=False)
+                    break
+        except Exception as e:
+            print(f"[Rule34Searcher] Watcher error: {e}")
 
     @loader.command(
         ru_doc="Обновить список прокси",
