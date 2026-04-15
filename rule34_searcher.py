@@ -24,6 +24,9 @@
 - spam_protection - защита от спама (по умолчанию: True)
 - auto_delete - автоудаление отправленных медиа (по умолчанию: True)
 - auto_delete_delay - задержка перед удалением в секундах (по умолчанию: 30)
+- download_before_send - скачивать файлы перед отправкой (по умолчанию: False)
+  * False = быстрее, но может не работать с некоторыми файлами
+  * True = медленнее, но надежнее (если Telegram блокирует прямые ссылки)
 """
 
 import random
@@ -355,10 +358,19 @@ class Rule34Searcher(loader.Module):
                 "Задержка в секундах перед автоудалением (0 для отключения)",
                 validator=loader.validators.Integer(minimum=0),
             ),
+            loader.ConfigValue(
+                "download_before_send",
+                False,
+                "Скачивать файлы перед отправкой (медленнее, но надежнее)",
+                validator=loader.validators.Boolean(),
+            ),
         )
         self._cache = {}
         self._working_proxies = []
         self._proxy_file = "booru_proxies.json"
+        
+        # Система исключения повторов
+        self._recent_posts = defaultdict(lambda: deque(maxlen=50))  # Храним последние 50 ID для каждого тега
         
         # Анти-спам система
         self._spam_events = defaultdict(deque)
@@ -516,7 +528,7 @@ class Rule34Searcher(loader.Module):
         antiai = self.config["antiai"]
         
         # Парсим теги из запроса
-        query_parts = tags.split()
+        query_parts = tags.split() if tags else []
         include_tags = []
         exclude_tags = []
         
@@ -533,7 +545,7 @@ class Rule34Searcher(loader.Module):
         all_exclude_tags = tags_ex_setting.split("; ") + exclude_tags
         tags_ex = [tag.strip() for tag in all_exclude_tags if tag.strip()]
         
-        # Добавляем анти-AI теги
+        # Добавляем анти-AI теги только если включено
         if antiai:
             anti_ai_tags = ['-ai_generated', '-stable_diffusion', '-midjourney', '-artificial_intelligence', 
                           '-neural_network', '-machine_learning', '-deepfake', '-ai_art', '-ai-generated', 
@@ -545,17 +557,24 @@ class Rule34Searcher(loader.Module):
             exclude_tags_api = ['-' + tag for tag in tags_ex]
             search_tags += ' ' + ' '.join(exclude_tags_api)
         
+        # Используем случайную страницу для разнообразия (от 0 до 10)
+        random_page = random.randint(0, 10)
+        
         # Параметры запроса с API ключом (БЕЗ json=1, чтобы получить XML)
         url = "https://api.rule34.xxx/index.php"
         params = {
             'page': 'dapi',
             's': 'post',
             'q': 'index',
-            'limit': limit,
-            'tags': search_tags,
+            'limit': min(limit, 1000),  # API максимум 1000
+            'pid': random_page,  # Случайная страница
+            'tags': search_tags.strip() if search_tags.strip() else None,
             'api_key': 'd82f6db279ce94313e629e791533d456a4309dfeb528ddab6eee4b7472156f0def07ebfd3e64b9dddbf0d3b78f227ba8a5f386533ef1ccb1377d8a97481811dc',
             'user_id': '5255009'
         }
+        
+        # Убираем пустые параметры
+        params = {k: v for k, v in params.items() if v is not None}
         
         response = await self._make_request(url, params, use_proxy=True)
         if not response:
@@ -566,7 +585,17 @@ class Rule34Searcher(loader.Module):
             root = ET.fromstring(response.text)
             posts = []
             
+            # Ключ для отслеживания повторов
+            tag_key = search_tags.strip() if search_tags.strip() else "random"
+            recent_ids = self._recent_posts[tag_key]
+            
             for post in root.findall("post"):
+                post_id = post.get("id", "")
+                
+                # Пропускаем если уже показывали недавно
+                if post_id in recent_ids:
+                    continue
+                
                 # Получаем URL изображения
                 image_url = post.get('file_url') or post.get('sample_url')
                 
@@ -581,7 +610,7 @@ class Rule34Searcher(loader.Module):
                     "file_url": image_url,
                     "tags": tags_list,
                     "rating": post.get("rating", ""),
-                    "id": post.get("id", ""),
+                    "id": post_id,
                 })
             
             return posts
@@ -616,18 +645,50 @@ class Rule34Searcher(loader.Module):
         
         return caption
 
+    async def _download_file(self, url: str) -> Optional[bytes]:
+        """Скачать файл по URL"""
+        try:
+            def _download():
+                headers = get_request_headers(self.config["proxy_rotate_ua"])
+                response = requests.get(url, headers=headers, timeout=30)
+                response.raise_for_status()
+                return response.content
+            
+            return await utils.run_sync(_download)
+        except Exception as e:
+            print(f"[Rule34Searcher] Error downloading file: {e}")
+            return None
+
     async def _send_posts(self, message: Message, posts: List[Dict], requested_tags: str, count: int):
         """Отправка постов (изображения и видео)"""
         if not posts:
             await utils.answer(message, self.strings["not_found"])
             return
         
-        selected_posts = random.sample(posts, min(count, len(posts)))
+        # Перемешиваем посты для случайности
+        random.shuffle(posts)
+        
+        # Ключ для отслеживания повторов
+        tag_key = requested_tags.strip() if requested_tags.strip() else "random"
+        recent_ids = self._recent_posts[tag_key]
         
         sent_count = 0
         sent_messages = []
-        for post in selected_posts:
+        attempts = 0
+        max_attempts = min(len(posts), count * 10)  # Пробуем до 10x больше постов чем нужно
+        
+        for post in posts:
+            if sent_count >= count:
+                break
+                
+            if attempts >= max_attempts:
+                break
+                
+            attempts += 1
+            
             file_url = post.get("file_url")
+            post_id = post.get("id", "")
+            
             if not file_url:
                 continue
             
@@ -638,24 +699,51 @@ class Rule34Searcher(loader.Module):
                 file_ext = file_url.lower().split('?')[0].split('.')[-1]
                 is_video = file_ext in ['mp4', 'webm', 'gif', 'mov', 'avi', 'mkv']
                 
-                # Отправляем файл
-                sent_msg = await message.client.send_file(
-                    message.peer_id,
-                    file_url,
-                    caption=caption,
-                    parse_mode="html",
-                    reply_to=getattr(message, "reply_to_msg_id", None),
-                    supports_streaming=is_video,  # Для видео включаем стриминг
-                )
+                # Если включено скачивание перед отправкой
+                if self.config["download_before_send"]:
+                    file_data = await self._download_file(file_url)
+                    if not file_data:
+                        continue
+                    
+                    # Отправляем скачанный файл
+                    sent_msg = await message.client.send_file(
+                        message.peer_id,
+                        file_data,
+                        caption=caption,
+                        parse_mode="html",
+                        reply_to=getattr(message, "reply_to_msg_id", None),
+                        supports_streaming=is_video,
+                        attributes=[],  # Telegram сам определит тип
+                    )
+                else:
+                    # Отправляем файл по URL (быстрее)
+                    sent_msg = await message.client.send_file(
+                        message.peer_id,
+                        file_url,
+                        caption=caption,
+                        parse_mode="html",
+                        reply_to=getattr(message, "reply_to_msg_id", None),
+                        supports_streaming=is_video,
+                    )
+                
                 sent_messages.append(sent_msg)
                 sent_count += 1
+                
+                # Добавляем ID в список недавно показанных
+                if post_id:
+                    recent_ids.append(post_id)
+                    
             except Exception as e:
-                # Если не удалось отправить, пробуем следующий пост
-                print(f"[Rule34Searcher] Error sending file: {e}")
+                # Логируем ошибку для отладки
+                error_msg = str(e)
+                print(f"[Rule34Searcher] Error sending file {file_url[:50]}...: {error_msg}")
+                
+                # Пропускаем этот пост и пробуем следующий
                 continue
         
         if sent_count == 0:
-            await utils.answer(message, f"❌ Не удалось отправить медиа. Найдено постов: {len(posts)}")
+            # Более информативное сообщение об ошибке
+            await utils.answer(message, f"❌ Не удалось отправить медиа.\nНайдено постов: {len(posts)}\nПопыток отправки: {attempts}\n\nВозможные причины:\n• Файлы слишком большие\n• Telegram не может загрузить файлы\n• Все файлы битые")
         else:
             await message.delete()
             
@@ -733,10 +821,21 @@ class Rule34Searcher(loader.Module):
         if await self._check_spam(user_id, chat_id):
             return
         
+        # Сохраняем оригинальный тег для подписи
+        display_tag = search_tag
+        
+        # Если нужны только видео, добавляем специальные теги для поиска
+        if video_only:
+            # Ищем с тегами video или animated для гарантии видео
+            video_tags = ["video", "animated", "webm", "mp4"]
+            search_tag = random.choice(video_tags)
+            # Для "порно" не показываем технический тег в подписи
+            display_tag = ""
+        
         # Поиск постов
         posts = await self._search_rule34(search_tag, self.config["posts_count"])
         
-        # Фильтрация только видео если нужно
+        # Дополнительная фильтрация только видео если нужно
         if video_only and posts:
             video_posts = []
             for post in posts:
@@ -744,13 +843,22 @@ class Rule34Searcher(loader.Module):
                 file_ext = file_url.lower().split('?')[0].split('.')[-1]
                 if file_ext in ['mp4', 'webm', 'mov', 'avi', 'mkv']:
                     video_posts.append(post)
-            posts = video_posts
+            
+            # Если после фильтрации ничего не осталось, пробуем еще раз с другим тегом
+            if not video_posts and posts:
+                # Пробуем найти хоть что-то с расширением видео
+                for post in posts:
+                    file_url = post.get("file_url", "")
+                    if any(ext in file_url.lower() for ext in ['.mp4', '.webm', '.mov', '.avi', '.mkv']):
+                        video_posts.append(post)
+            
+            posts = video_posts if video_posts else posts
         
         if not posts:
             return
         
-        # Отправка одного поста
-        await self._send_posts(message, posts, search_tag, 1)
+        # Отправка одного поста с правильным тегом для подписи
+        await self._send_posts(message, posts, display_tag, 1)
 
     @loader.watcher()
     async def watcher(self, message: Message):
@@ -772,16 +880,21 @@ class Rule34Searcher(loader.Module):
             
             text_lower = message.text.lower()
             
-            # Проверяем триггер-слова
-            for trigger_word, search_tag in self.triggers.items():
-                if trigger_word in text_lower:
-                    if search_tag == "video":
-                        # Для "порно" ищем любой контент но только видео
-                        await self._search_and_send_by_trigger(message, "", video_only=True)
-                    else:
-                        # Для остальных ищем по тегу
-                        await self._search_and_send_by_trigger(message, search_tag, video_only=False)
-                    break
+            # Проверяем триггер-слова в определенном порядке
+            # Сначала проверяем "порно" (чтобы не путалось с другими)
+            if "порно" in text_lower:
+                await self._search_and_send_by_trigger(message, "", video_only=True)
+                return
+            
+            # Потом остальные триггеры
+            if "фута" in text_lower:
+                await self._search_and_send_by_trigger(message, "futa", video_only=False)
+                return
+                
+            if "фембой" in text_lower:
+                await self._search_and_send_by_trigger(message, "femboy", video_only=False)
+                return
+                
         except Exception as e:
             print(f"[Rule34Searcher] Watcher error: {e}")
 
