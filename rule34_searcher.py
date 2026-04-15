@@ -13,6 +13,7 @@
 - .r34 [теги] [кол-во] - поиск на Rule34
 - .updateproxy - обновить список прокси
 - .testr34 [тег] - тест API
+- .whitelist [add/remove/list] [chat_id] - управление вайтлистом чатов
 
 Триггер-слова (автоматический поиск):
 - "фута" - поиск по тегу futa (картинки)
@@ -27,6 +28,14 @@
 - download_before_send - скачивать файлы перед отправкой (по умолчанию: False)
   * False = быстрее, но может не работать с некоторыми файлами
   * True = медленнее, но надежнее (если Telegram блокирует прямые ссылки)
+- chat_whitelist_enabled - включить вайтлист чатов (по умолчанию: False)
+  * False = работает во всех чатах
+  * True = работает только в чатах из вайтлиста
+
+Управление вайтлистом:
+- .whitelist list - показать список разрешенных чатов
+- .whitelist add [chat_id] - добавить чат в вайтлист
+- .whitelist remove [chat_id] - удалить чат из вайтлиста
 """
 
 import random
@@ -230,6 +239,8 @@ class Rule34Searcher(loader.Module):
         "proxy_update_started": "Обновление прокси началось...",
         "proxy_update_success": "Список прокси обновлен! Найдено {} рабочих прокси",
         "proxy_update_error": "Ошибка при обновлении прокси: {}",
+        "whitelist_help": "❌ <b>Укажите аргумент для команды!</b>\n\n<b>Использование:</b>\n• <code>.whitelist add [chat_id]</code> - добавить чат\n• <code>.whitelist remove [chat_id]</code> - удалить чат\n• <code>.whitelist list</code> - показать список",
+        "chat_not_whitelisted": "⚠️ <b>Чат не в вайтлисте!</b>\n\nДобавьте сначала этот чат в вайтлист:\n<code>.whitelist add {}</code>\n\nИли отключите вайтлист в конфиге модуля.",
     }
     
     strings_en = {
@@ -240,6 +251,8 @@ class Rule34Searcher(loader.Module):
         "proxy_update_started": "Proxy update started...",
         "proxy_update_success": "Proxy list updated! Found {} working proxies",
         "proxy_update_error": "Proxy update error: {}",
+        "whitelist_help": "❌ <b>Specify command argument!</b>\n\n<b>Usage:</b>\n• <code>.whitelist add [chat_id]</code> - add chat\n• <code>.whitelist remove [chat_id]</code> - remove chat\n• <code>.whitelist list</code> - show list",
+        "chat_not_whitelisted": "⚠️ <b>Chat not in whitelist!</b>\n\nAdd this chat to whitelist first:\n<code>.whitelist add {}</code>\n\nOr disable whitelist in module config.",
     }
 
     def __init__(self):
@@ -364,10 +377,19 @@ class Rule34Searcher(loader.Module):
                 "Скачивать файлы перед отправкой (медленнее, но надежнее)",
                 validator=loader.validators.Boolean(),
             ),
+            loader.ConfigValue(
+                "chat_whitelist_enabled",
+                False,
+                "Включить вайтлист чатов (работать только в разрешенных чатах)",
+                validator=loader.validators.Boolean(),
+            ),
         )
         self._cache = {}
         self._working_proxies = []
         self._proxy_file = "booru_proxies.json"
+        
+        # Вайтлист чатов (будет загружаться из БД)
+        self._chat_whitelist = set()
         
         # Система исключения повторов
         self._recent_posts = defaultdict(lambda: deque(maxlen=50))  # Храним последние 50 ID для каждого тега
@@ -391,6 +413,38 @@ class Rule34Searcher(loader.Module):
             "фембой": "femboy",
             "порно": "video"  # специальный маркер для видео
         }
+
+    async def client_ready(self, client, db):
+        """Инициализация при запуске"""
+        self.client = client
+        self._db = db
+        # Загружаем вайтлист из БД
+        self._chat_whitelist = set(self._db.get(__name__, "chat_whitelist", []))
+
+    def _get_chat_id(self, peer_id) -> int:
+        """Получить числовой ID чата из объекта Peer"""
+        if hasattr(peer_id, 'channel_id'):
+            return -1000000000000 - peer_id.channel_id
+        elif hasattr(peer_id, 'chat_id'):
+            return -peer_id.chat_id
+        elif hasattr(peer_id, 'user_id'):
+            return peer_id.user_id
+        else:
+            return peer_id
+
+    def _is_chat_allowed(self, chat_id) -> bool:
+        """Проверка разрешен ли чат"""
+        if not self.config["chat_whitelist_enabled"]:
+            return True  # Если вайтлист выключен, разрешены все чаты
+        
+        # Получаем числовой ID
+        chat_id_num = self._get_chat_id(chat_id)
+        
+        return chat_id_num in self._chat_whitelist
+
+    def _save_whitelist(self):
+        """Сохранить вайтлист в БД"""
+        self._db.set(__name__, "chat_whitelist", list(self._chat_whitelist))
 
     def _save_proxies(self):
         """Сохранить рабочие прокси в файл"""
@@ -878,6 +932,10 @@ class Rule34Searcher(loader.Module):
             if message.out:
                 return
             
+            # Проверяем вайтлист чатов
+            if not self._is_chat_allowed(message.peer_id):
+                return
+            
             text_lower = message.text.lower()
             
             # Проверяем триггер-слова в определенном порядке
@@ -897,6 +955,137 @@ class Rule34Searcher(loader.Module):
                 
         except Exception as e:
             print(f"[Rule34Searcher] Watcher error: {e}")
+
+    @loader.command(
+        ru_doc="Управление вайтлистом чатов",
+        en_doc="Manage chat whitelist",
+    )
+    async def whitelistcmd(self, message: Message):
+        """[add/remove/list] [chat_id] - Управление вайтлистом чатов"""
+        args = utils.get_args_raw(message)
+        
+        # Получаем числовой ID текущего чата
+        current_chat_id = self._get_chat_id(message.peer_id)
+        
+        if not args:
+            await utils.answer(
+                message,
+                "❌ <b>Укажите аргумент для команды!</b>\n\n"
+                "<b>Использование:</b>\n"
+                "• <code>.whitelist add [chat_id]</code> - добавить чат\n"
+                "• <code>.whitelist remove [chat_id]</code> - удалить чат\n"
+                "• <code>.whitelist list</code> - показать список\n\n"
+                "<b>Примеры:</b>\n"
+                "• <code>.whitelist add -1001234567890</code>\n"
+                "• <code>.whitelist remove -1001234567890</code>\n"
+                "• <code>.whitelist list</code>\n\n"
+                "<b>Текущий чат ID:</b> <code>{}</code>".format(current_chat_id)
+            )
+            return
+        
+        parts = args.split(maxsplit=1)
+        action = parts[0].lower()
+        
+        if action == "list":
+            if not self._chat_whitelist:
+                await utils.answer(
+                    message,
+                    "📋 <b>Вайтлист пуст</b>\n\n"
+                    "Добавьте чаты командой:\n"
+                    "<code>.whitelist add [chat_id]</code>"
+                )
+                return
+            
+            whitelist_text = "📋 <b>Вайтлист чатов:</b>\n\n"
+            for chat_id in sorted(self._chat_whitelist):
+                try:
+                    chat = await message.client.get_entity(chat_id)
+                    chat_name = getattr(chat, 'title', getattr(chat, 'username', 'Unknown'))
+                    whitelist_text += f"• <code>{chat_id}</code> - {chat_name}\n"
+                except Exception:
+                    whitelist_text += f"• <code>{chat_id}</code>\n"
+            
+            whitelist_text += f"\n<b>Всего чатов:</b> {len(self._chat_whitelist)}"
+            whitelist_text += f"\n<b>Вайтлист:</b> {'✅ Включен' if self.config['chat_whitelist_enabled'] else '❌ Выключен'}"
+            
+            await utils.answer(message, whitelist_text)
+            return
+        
+        if action == "add":
+            if len(parts) < 2:
+                await utils.answer(
+                    message,
+                    "❌ <b>Укажите ID чата!</b>\n\n"
+                    "<b>Использование:</b>\n"
+                    "<code>.whitelist add [chat_id]</code>\n\n"
+                    "<b>Пример:</b>\n"
+                    "<code>.whitelist add -1001234567890</code>\n\n"
+                    "<b>Текущий чат ID:</b> <code>{}</code>".format(current_chat_id)
+                )
+                return
+            
+            try:
+                chat_id = int(parts[1])
+            except ValueError:
+                await utils.answer(message, "❌ <b>Неверный формат ID чата!</b>\n\nID должен быть числом.")
+                return
+            
+            if chat_id in self._chat_whitelist:
+                await utils.answer(message, f"⚠️ Чат <code>{chat_id}</code> уже в вайтлисте!")
+                return
+            
+            self._chat_whitelist.add(chat_id)
+            self._save_whitelist()
+            
+            await utils.answer(
+                message,
+                f"✅ <b>Чат добавлен в вайтлист!</b>\n\n"
+                f"<b>ID:</b> <code>{chat_id}</code>\n"
+                f"<b>Всего в вайтлисте:</b> {len(self._chat_whitelist)}"
+            )
+            return
+        
+        if action == "remove":
+            if len(parts) < 2:
+                await utils.answer(
+                    message,
+                    "❌ <b>Укажите ID чата!</b>\n\n"
+                    "<b>Использование:</b>\n"
+                    "<code>.whitelist remove [chat_id]</code>\n\n"
+                    "<b>Пример:</b>\n"
+                    "<code>.whitelist remove -1001234567890</code>"
+                )
+                return
+            
+            try:
+                chat_id = int(parts[1])
+            except ValueError:
+                await utils.answer(message, "❌ <b>Неверный формат ID чата!</b>\n\nID должен быть числом.")
+                return
+            
+            if chat_id not in self._chat_whitelist:
+                await utils.answer(message, f"⚠️ Чат <code>{chat_id}</code> не найден в вайтлисте!")
+                return
+            
+            self._chat_whitelist.remove(chat_id)
+            self._save_whitelist()
+            
+            await utils.answer(
+                message,
+                f"✅ <b>Чат удален из вайтлиста!</b>\n\n"
+                f"<b>ID:</b> <code>{chat_id}</code>\n"
+                f"<b>Осталось в вайтлисте:</b> {len(self._chat_whitelist)}"
+            )
+            return
+        
+        await utils.answer(
+            message,
+            f"❌ <b>Неизвестный аргумент:</b> <code>{action}</code>\n\n"
+            "<b>Доступные аргументы:</b>\n"
+            "• <code>add</code> - добавить чат\n"
+            "• <code>remove</code> - удалить чат\n"
+            "• <code>list</code> - показать список"
+        )
 
     @loader.command(
         ru_doc="Обновить список прокси",
@@ -970,6 +1159,12 @@ class Rule34Searcher(loader.Module):
     )
     async def r34cmd(self, message: Message):
         """[теги] [кол-во] - Поиск на Rule34"""
+        # Проверяем вайтлист для команд
+        if not self._is_chat_allowed(message.peer_id):
+            chat_id_num = self._get_chat_id(message.peer_id)
+            await utils.answer(message, self.strings["chat_not_whitelisted"].format(chat_id_num))
+            return
+        
         args = utils.get_args_raw(message)
         if not args:
             await utils.answer(message, self.strings["usage_r34"])
