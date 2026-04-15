@@ -420,6 +420,18 @@ class Rule34Searcher(loader.Module):
         self._db = db
         # Загружаем вайтлист из БД
         self._chat_whitelist = set(self._db.get(__name__, "chat_whitelist", []))
+        
+        # Определяем язык юзербота
+        self._lang = self._db.get("heroku.loader", "lang", "en")
+        if self._lang not in ["ru", "en"]:
+            self._lang = "en"
+
+    def _get_string(self, key: str) -> str:
+        """Получить строку на нужном языке"""
+        if self._lang == "ru":
+            return self.strings.get(key, key)
+        else:
+            return self.strings_en.get(key, self.strings.get(key, key))
 
     def _get_chat_id(self, peer_id) -> int:
         """Получить числовой ID чата из объекта Peer"""
@@ -716,7 +728,7 @@ class Rule34Searcher(loader.Module):
     async def _send_posts(self, message: Message, posts: List[Dict], requested_tags: str, count: int):
         """Отправка постов (изображения и видео)"""
         if not posts:
-            await utils.answer(message, self.strings["not_found"])
+            await utils.answer(message, self._get_string("not_found"))
             return
         
         # Перемешиваем посты для случайности
@@ -968,18 +980,10 @@ class Rule34Searcher(loader.Module):
         current_chat_id = self._get_chat_id(message.peer_id)
         
         if not args:
+            help_text = self._get_string("whitelist_help")
             await utils.answer(
                 message,
-                "❌ <b>Укажите аргумент для команды!</b>\n\n"
-                "<b>Использование:</b>\n"
-                "• <code>.whitelist add [chat_id]</code> - добавить чат\n"
-                "• <code>.whitelist remove [chat_id]</code> - удалить чат\n"
-                "• <code>.whitelist list</code> - показать список\n\n"
-                "<b>Примеры:</b>\n"
-                "• <code>.whitelist add -1001234567890</code>\n"
-                "• <code>.whitelist remove -1001234567890</code>\n"
-                "• <code>.whitelist list</code>\n\n"
-                "<b>Текущий чат ID:</b> <code>{}</code>".format(current_chat_id)
+                f"{help_text}\n\n<b>{'Текущий чат ID' if self._lang == 'ru' else 'Current chat ID'}:</b> <code>{current_chat_id}</code>"
             )
             return
         
@@ -990,13 +994,13 @@ class Rule34Searcher(loader.Module):
             if not self._chat_whitelist:
                 await utils.answer(
                     message,
-                    "📋 <b>Вайтлист пуст</b>\n\n"
-                    "Добавьте чаты командой:\n"
+                    f"📋 <b>{'Вайтлист пуст' if self._lang == 'ru' else 'Whitelist is empty'}</b>\n\n"
+                    f"{'Добавьте чаты командой' if self._lang == 'ru' else 'Add chats with command'}:\n"
                     "<code>.whitelist add [chat_id]</code>"
                 )
                 return
             
-            whitelist_text = "📋 <b>Вайтлист чатов:</b>\n\n"
+            whitelist_text = f"📋 <b>{'Вайтлист чатов' if self._lang == 'ru' else 'Chat whitelist'}:</b>\n\n"
             for chat_id in sorted(self._chat_whitelist):
                 try:
                     chat = await message.client.get_entity(chat_id)
@@ -1005,8 +1009,8 @@ class Rule34Searcher(loader.Module):
                 except Exception:
                     whitelist_text += f"• <code>{chat_id}</code>\n"
             
-            whitelist_text += f"\n<b>Всего чатов:</b> {len(self._chat_whitelist)}"
-            whitelist_text += f"\n<b>Вайтлист:</b> {'✅ Включен' if self.config['chat_whitelist_enabled'] else '❌ Выключен'}"
+            whitelist_text += f"\n<b>{'Всего чатов' if self._lang == 'ru' else 'Total chats'}:</b> {len(self._chat_whitelist)}"
+            whitelist_text += f"\n<b>{'Вайтлист' if self._lang == 'ru' else 'Whitelist'}:</b> {'✅ Включен' if self.config['chat_whitelist_enabled'] else '❌ Выключен'}" if self._lang == 'ru' else f"\n<b>Whitelist:</b> {'✅ Enabled' if self.config['chat_whitelist_enabled'] else '❌ Disabled'}"
             
             await utils.answer(message, whitelist_text)
             return
@@ -1015,33 +1019,41 @@ class Rule34Searcher(loader.Module):
             if len(parts) < 2:
                 await utils.answer(
                     message,
-                    "❌ <b>Укажите ID чата!</b>\n\n"
-                    "<b>Использование:</b>\n"
+                    f"❌ <b>{'Укажите ID чата!' if self._lang == 'ru' else 'Specify chat ID!'}</b>\n\n"
+                    f"<b>{'Использование' if self._lang == 'ru' else 'Usage'}:</b>\n"
                     "<code>.whitelist add [chat_id]</code>\n\n"
-                    "<b>Пример:</b>\n"
+                    f"<b>{'Пример' if self._lang == 'ru' else 'Example'}:</b>\n"
                     "<code>.whitelist add -1001234567890</code>\n\n"
-                    "<b>Текущий чат ID:</b> <code>{}</code>".format(current_chat_id)
+                    f"<b>{'Текущий чат ID' if self._lang == 'ru' else 'Current chat ID'}:</b> <code>{current_chat_id}</code>"
                 )
                 return
             
             try:
                 chat_id = int(parts[1])
             except ValueError:
-                await utils.answer(message, "❌ <b>Неверный формат ID чата!</b>\n\nID должен быть числом.")
+                await utils.answer(
+                    message, 
+                    f"❌ <b>{'Неверный формат ID чата!' if self._lang == 'ru' else 'Invalid chat ID format!'}</b>\n\n"
+                    f"{'ID должен быть числом.' if self._lang == 'ru' else 'ID must be a number.'}"
+                )
                 return
             
             if chat_id in self._chat_whitelist:
-                await utils.answer(message, f"⚠️ Чат <code>{chat_id}</code> уже в вайтлисте!")
+                await utils.answer(
+                    message, 
+                    f"⚠️ {'Чат' if self._lang == 'ru' else 'Chat'} <code>{chat_id}</code> {'уже в вайтлисте!' if self._lang == 'ru' else 'already in whitelist!'}"
+                )
                 return
             
             self._chat_whitelist.add(chat_id)
             self._save_whitelist()
             
+            total_text = f"{'Всего в вайтлисте' if self._lang == 'ru' else 'Total in whitelist'}"
             await utils.answer(
                 message,
-                f"✅ <b>Чат добавлен в вайтлист!</b>\n\n"
+                f"✅ <b>{'Чат добавлен в вайтлист!' if self._lang == 'ru' else 'Chat added to whitelist!'}</b>\n\n"
                 f"<b>ID:</b> <code>{chat_id}</code>\n"
-                f"<b>Всего в вайтлисте:</b> {len(self._chat_whitelist)}"
+                f"<b>{total_text}:</b> {len(self._chat_whitelist)}"
             )
             return
         
@@ -1049,10 +1061,10 @@ class Rule34Searcher(loader.Module):
             if len(parts) < 2:
                 await utils.answer(
                     message,
-                    "❌ <b>Укажите ID чата!</b>\n\n"
-                    "<b>Использование:</b>\n"
+                    f"❌ <b>{'Укажите ID чата!' if self._lang == 'ru' else 'Specify chat ID!'}</b>\n\n"
+                    f"<b>{'Использование' if self._lang == 'ru' else 'Usage'}:</b>\n"
                     "<code>.whitelist remove [chat_id]</code>\n\n"
-                    "<b>Пример:</b>\n"
+                    f"<b>{'Пример' if self._lang == 'ru' else 'Example'}:</b>\n"
                     "<code>.whitelist remove -1001234567890</code>"
                 )
                 return
@@ -1060,31 +1072,39 @@ class Rule34Searcher(loader.Module):
             try:
                 chat_id = int(parts[1])
             except ValueError:
-                await utils.answer(message, "❌ <b>Неверный формат ID чата!</b>\n\nID должен быть числом.")
+                await utils.answer(
+                    message, 
+                    f"❌ <b>{'Неверный формат ID чата!' if self._lang == 'ru' else 'Invalid chat ID format!'}</b>\n\n"
+                    f"{'ID должен быть числом.' if self._lang == 'ru' else 'ID must be a number.'}"
+                )
                 return
             
             if chat_id not in self._chat_whitelist:
-                await utils.answer(message, f"⚠️ Чат <code>{chat_id}</code> не найден в вайтлисте!")
+                await utils.answer(
+                    message, 
+                    f"⚠️ {'Чат' if self._lang == 'ru' else 'Chat'} <code>{chat_id}</code> {'не найден в вайтлисте!' if self._lang == 'ru' else 'not found in whitelist!'}"
+                )
                 return
             
             self._chat_whitelist.remove(chat_id)
             self._save_whitelist()
             
+            remaining_text = f"{'Осталось в вайтлисте' if self._lang == 'ru' else 'Remaining in whitelist'}"
             await utils.answer(
                 message,
-                f"✅ <b>Чат удален из вайтлиста!</b>\n\n"
+                f"✅ <b>{'Чат удален из вайтлиста!' if self._lang == 'ru' else 'Chat removed from whitelist!'}</b>\n\n"
                 f"<b>ID:</b> <code>{chat_id}</code>\n"
-                f"<b>Осталось в вайтлисте:</b> {len(self._chat_whitelist)}"
+                f"<b>{remaining_text}:</b> {len(self._chat_whitelist)}"
             )
             return
         
         await utils.answer(
             message,
-            f"❌ <b>Неизвестный аргумент:</b> <code>{action}</code>\n\n"
-            "<b>Доступные аргументы:</b>\n"
-            "• <code>add</code> - добавить чат\n"
-            "• <code>remove</code> - удалить чат\n"
-            "• <code>list</code> - показать список"
+            f"❌ <b>{'Неизвестный аргумент' if self._lang == 'ru' else 'Unknown argument'}:</b> <code>{action}</code>\n\n"
+            f"<b>{'Доступные аргументы' if self._lang == 'ru' else 'Available arguments'}:</b>\n"
+            f"• <code>add</code> - {'добавить чат' if self._lang == 'ru' else 'add chat'}\n"
+            f"• <code>remove</code> - {'удалить чат' if self._lang == 'ru' else 'remove chat'}\n"
+            f"• <code>list</code> - {'показать список' if self._lang == 'ru' else 'show list'}"
         )
 
     @loader.command(
@@ -1093,13 +1113,13 @@ class Rule34Searcher(loader.Module):
     )
     async def updateproxycmd(self, message: Message):
         """Обновить список прокси"""
-        await utils.answer(message, self.strings["proxy_update_started"])
+        await utils.answer(message, self._get_string("proxy_update_started"))
         
         try:
             count = await self._update_proxy_list()
-            await utils.answer(message, self.strings["proxy_update_success"].format(count))
+            await utils.answer(message, self._get_string("proxy_update_success").format(count))
         except Exception as e:
-            await utils.answer(message, self.strings["proxy_update_error"].format(str(e)))
+            await utils.answer(message, self._get_string("proxy_update_error").format(str(e)))
 
     @loader.command(
         ru_doc="Тест API Rule34",
@@ -1162,12 +1182,12 @@ class Rule34Searcher(loader.Module):
         # Проверяем вайтлист для команд
         if not self._is_chat_allowed(message.peer_id):
             chat_id_num = self._get_chat_id(message.peer_id)
-            await utils.answer(message, self.strings["chat_not_whitelisted"].format(chat_id_num))
+            await utils.answer(message, self._get_string("chat_not_whitelisted").format(chat_id_num))
             return
         
         args = utils.get_args_raw(message)
         if not args:
-            await utils.answer(message, self.strings["usage_r34"])
+            await utils.answer(message, self._get_string("usage_r34"))
             return
         
         parts = args.rsplit(maxsplit=1)
@@ -1179,7 +1199,7 @@ class Rule34Searcher(loader.Module):
         else:
             tags = args
         
-        await utils.answer(message, self.strings["searching"])
+        await utils.answer(message, self._get_string("searching"))
         
         posts = await self._search_rule34(tags, self.config["posts_count"])
         
