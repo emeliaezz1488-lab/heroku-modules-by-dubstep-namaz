@@ -1,5 +1,5 @@
 # meta developer: @dubstep_namaz1337
-# meta banner: https://i.imgur.com/7QZ8Z9Q.png
+# meta banner: https://i.imgur.com/gallery/icon-of-rule34-FAzGMDE
 
 """
 Модуль для поиска изображений и видео на Rule34.
@@ -271,7 +271,7 @@ class Rule34Searcher(loader.Module):
             ),
             loader.ConfigValue(
                 "antiai",
-                False,
+                True,
                 "Фильтр AI-контента",
                 validator=loader.validators.Boolean(),
             ),
@@ -286,30 +286,6 @@ class Rule34Searcher(loader.Module):
                 1,
                 "Сколько постов отправлять (макс: 10)",
                 validator=loader.validators.Integer(minimum=1, maximum=10),
-            ),
-            loader.ConfigValue(
-                "show_requested_tags",
-                True,
-                "Показывать запрошенные теги",
-                validator=loader.validators.Boolean(),
-            ),
-            loader.ConfigValue(
-                "show_post_tags",
-                True,
-                "Показывать теги поста",
-                validator=loader.validators.Boolean(),
-            ),
-            loader.ConfigValue(
-                "show_image_link",
-                True,
-                "Показывать ссылку на изображение",
-                validator=loader.validators.Boolean(),
-            ),
-            loader.ConfigValue(
-                "show_rating",
-                True,
-                "Показывать рейтинг",
-                validator=loader.validators.Boolean(),
             ),
             loader.ConfigValue(
                 "use_proxy",
@@ -379,7 +355,7 @@ class Rule34Searcher(loader.Module):
             ),
             loader.ConfigValue(
                 "chat_whitelist_enabled",
-                False,
+                True,
                 "Включить вайтлист чатов (работать только в разрешенных чатах)",
                 validator=loader.validators.Boolean(),
             ),
@@ -689,10 +665,10 @@ class Rule34Searcher(loader.Module):
         """Форматирование подписи к посту"""
         caption = "🔞 <b>Найден пост!</b>\n\n"
         
-        if self.config["show_requested_tags"] and requested_tags:
+        if requested_tags:
             caption += f"🔍 <b>Запрошенные теги:</b> <code>{requested_tags}</code>\n\n"
         
-        if self.config["show_post_tags"] and post.get("tags"):
+        if post.get("tags"):
             tags_list = post["tags"]
             if isinstance(tags_list, list):
                 tags = ' '.join(tags_list)
@@ -701,12 +677,12 @@ class Rule34Searcher(loader.Module):
             tags = tags[:200] + "..." if len(tags) > 200 else tags
             caption += f"🏷️ <b>Теги в посте:</b> <code>{tags}</code>\n\n"
         
-        if self.config["show_rating"] and post.get("rating"):
+        if post.get("rating"):
             rating_map = {"s": "Safe", "q": "Questionable", "e": "Explicit", "g": "General"}
             rating = rating_map.get(post["rating"].lower(), post["rating"])
             caption += f"🔞 <b>Рейтинг:</b> <code>{rating}</code>\n\n"
         
-        if self.config["show_image_link"] and post.get("file_url"):
+        if post.get("file_url"):
             caption += f'🔗 <b>Ссылка:</b> <a href="{post["file_url"]}">Открыть изображение</a>'
         
         return caption
