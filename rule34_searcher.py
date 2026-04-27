@@ -678,29 +678,7 @@ class Rule34Searcher(loader.Module):
 
     def _format_caption(self, post: Dict, requested_tags: str) -> str:
         """Форматирование подписи к посту"""
-        caption = "🔞 <b>Найден пост!</b>\n\n"
-        
-        if requested_tags:
-            caption += f"🔍 <b>Запрошенные теги:</b> <code>{requested_tags}</code>\n\n"
-        
-        if post.get("tags"):
-            tags_list = post["tags"]
-            if isinstance(tags_list, list):
-                tags = ' '.join(tags_list)
-            else:
-                tags = str(tags_list)
-            tags = tags[:200] + "..." if len(tags) > 200 else tags
-            caption += f"🏷️ <b>Теги в посте:</b> <code>{tags}</code>\n\n"
-        
-        if post.get("rating"):
-            rating_map = {"s": "Safe", "q": "Questionable", "e": "Explicit", "g": "General"}
-            rating = rating_map.get(post["rating"].lower(), post["rating"])
-            caption += f"🔞 <b>Рейтинг:</b> <code>{rating}</code>\n\n"
-        
-        if post.get("file_url"):
-            caption += f'🔗 <b>Ссылка:</b> <a href="{post["file_url"]}">Открыть изображение</a>'
-        
-        return caption
+        return "🔞 <b>Найден пост!</b>"
 
     async def _download_file(self, url: str) -> Optional[bytes]:
         """Скачать файл по URL"""
