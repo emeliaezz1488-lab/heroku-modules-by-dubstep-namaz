@@ -2,17 +2,21 @@
 # meta banner: https://i.imgur.com/gallery/icon-of-rule34-FAzGMDE
 
 """
-Модуль для поиска изображений и видео на Rule34.
+Модуль для поиска изображений и видео на Rule34 и Danbooru.
 
 Это порт плагина с exteraGram для Heroku UserBot.
 
 Оригинальные разработчики: @ArThirtyFour | @KangelPlugins
 Портировал: @dubstep_namaz1337
 
+Команды:
+- .r34 [теги] [кол-во] - поиск на Rule34
+- .danbooru [теги] [кол-во] - поиск на Danbooru
+
 Триггер-слова (автоматический поиск):
 - "фута" - поиск по тегу futa (картинки)
 - "фембой" - поиск по тегу femboy (картинки)
-- "порно" - случайное видео с Rule34
+- "порно" - случайное видео
 """
 
 import random
@@ -205,7 +209,7 @@ def localise(key: str, lang: str = "ru") -> str:
 
 @loader.tds
 class Rule34Searcher(loader.Module):
-    """Поиск изображений и видео на Rule34"""
+    """Поиск изображений и видео на Rule34 и Danbooru"""
     
     strings = {
         "name": "Rule34Searcher",
@@ -213,6 +217,7 @@ class Rule34Searcher(loader.Module):
         "searching": "Ищем...",
         "error": "Ошибка: {}",
         "usage_r34": "Использование: .r34 [теги] [кол-во]\nПример: .r34 anime 2",
+        "usage_danbooru": "Использование: .danbooru [теги] [кол-во]\nПример: .danbooru anime 2",
         "proxy_update_started": "Обновление прокси началось...",
         "proxy_update_success": "Список прокси обновлен! Найдено {} рабочих прокси",
         "proxy_update_error": "Ошибка при обновлении прокси: {}",
@@ -250,6 +255,7 @@ class Rule34Searcher(loader.Module):
         "searching": "Searching...",
         "error": "Error: {}",
         "usage_r34": "Usage: .r34 [tags] [count]\nExample: .r34 anime 2",
+        "usage_danbooru": "Usage: .danbooru [tags] [count]\nExample: .danbooru anime 2",
         "proxy_update_started": "Proxy update started...",
         "proxy_update_success": "Proxy list updated! Found {} working proxies",
         "proxy_update_error": "Proxy update error: {}",
@@ -385,6 +391,12 @@ class Rule34Searcher(loader.Module):
                 True,
                 "Включить вайтлист чатов (работать только в разрешенных чатах)",
                 validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "default_source",
+                "rule34",
+                "Источник по умолчанию (rule34/danbooru)",
+                validator=loader.validators.Choice(["rule34", "danbooru"]),
             ),
         )
         self._cache = {}
@@ -550,31 +562,43 @@ class Rule34Searcher(loader.Module):
             
             # Сначала пробуем без прокси
             try:
-                response = requests.get(url, params=params, headers=headers, timeout=5)
+                response = requests.get(url, params=params, headers=headers, timeout=10)
                 response.raise_for_status()
                 return response
-            except Exception:
+            except Exception as e:
+                print(f"[Rule34Searcher] Request failed (no proxy): {e}")
                 # Если не удалось и включены прокси
                 if use_proxy and self.config["use_proxy"]:
                     proxy_dict = self._get_working_proxy(url)
                     if proxy_dict:
-                        response = requests.get(url, params=params, headers=headers, proxies=proxy_dict, timeout=10)
-                        response.raise_for_status()
-                        return response
-                    else:
-                        # Пробуем еще раз без прокси
+                        try:
+                            response = requests.get(url, params=params, headers=headers, proxies=proxy_dict, timeout=10)
+                            response.raise_for_status()
+                            return response
+                        except Exception as e2:
+                            print(f"[Rule34Searcher] Request failed (with proxy): {e2}")
+                    # Пробуем еще раз без прокси
+                    try:
                         response = requests.get(url, params=params, headers=headers, timeout=10)
                         response.raise_for_status()
                         return response
+                    except Exception as e3:
+                        print(f"[Rule34Searcher] Request failed (retry no proxy): {e3}")
+                        raise e3
                 else:
                     # Пробуем еще раз без прокси
-                    response = requests.get(url, params=params, headers=headers, timeout=10)
-                    response.raise_for_status()
-                    return response
+                    try:
+                        response = requests.get(url, params=params, headers=headers, timeout=10)
+                        response.raise_for_status()
+                        return response
+                    except Exception as e4:
+                        print(f"[Rule34Searcher] Request failed (final retry): {e4}")
+                        raise e4
         
         try:
             return await utils.run_sync(_request)
-        except Exception:
+        except Exception as e:
+            print(f"[Rule34Searcher] _make_request exception: {e}")
             return None
 
     async def _search_rule34(self, tags: str, limit: int = 100) -> List[Dict]:
@@ -675,6 +699,112 @@ class Rule34Searcher(loader.Module):
             # Логируем ошибку для отладки
             print(f"[Rule34Searcher] Error parsing Rule34 response: {e}")
             return []
+
+    async def _search_danbooru(self, tags: str, limit: int = 100) -> List[Dict]:
+        """Поиск на Danbooru с полной поддержкой прокси и API"""
+        # Для Danbooru используем только базовые теги без дополнительных фильтров
+        # Парсим теги из запроса
+        query_parts = tags.split() if tags else []
+        include_tags = []
+        
+        for part in query_parts:
+            if not part.startswith('-'):
+                include_tags.append(part)
+        
+        # Строим поисковый запрос (только включающие теги)
+        search_tags = ' '.join(include_tags).strip()
+        
+        # Параметры запроса (БЕЗ login и api_key в параметрах)
+        url = "https://danbooru.donmai.us/posts.json"
+        params = {
+            'limit': min(limit, 20),
+            'tags': search_tags if search_tags else None,
+        }
+        
+        # Убираем пустые параметры
+        params = {k: v for k, v in params.items() if v is not None}
+        
+        print(f"[Rule34Searcher] Danbooru request URL: {url}")
+        print(f"[Rule34Searcher] Danbooru params: {params}")
+        
+        # Используем специальный метод с HTTP Basic Auth
+        response = await self._make_danbooru_request(url, params)
+        if not response:
+            print(f"[Rule34Searcher] Danbooru: No response from API")
+            return []
+        
+        print(f"[Rule34Searcher] Danbooru response status: {response.status_code}")
+        print(f"[Rule34Searcher] Danbooru response text (first 500 chars): {response.text[:500]}")
+        
+        try:
+            # Парсим JSON ответ
+            data = response.json()
+            print(f"[Rule34Searcher] Danbooru: Received {len(data)} posts")
+            posts = []
+            
+            # Ключ для отслеживания повторов
+            tag_key = "danbooru_" + (search_tags if search_tags else "random")
+            recent_ids = self._recent_posts[tag_key]
+            
+            for post in data:
+                post_id = str(post.get("id", ""))
+                
+                # Пропускаем если уже показывали недавно
+                if post_id in recent_ids:
+                    continue
+                
+                # Получаем URL изображения (приоритет: file_url > large_file_url > preview_file_url)
+                image_url = post.get('file_url') or post.get('large_file_url') or post.get('preview_file_url')
+                
+                if not image_url:
+                    print(f"[Rule34Searcher] Danbooru: Post {post_id} has no image URL")
+                    continue
+                
+                # Парсим теги
+                tag_string = post.get('tag_string', '')
+                tags_list = tag_string.split() if tag_string else []
+                
+                posts.append({
+                    "file_url": image_url,
+                    "tags": tags_list,
+                    "rating": post.get("rating", ""),
+                    "id": post_id,
+                })
+            
+            print(f"[Rule34Searcher] Danbooru: Returning {len(posts)} posts after filtering")
+            return posts
+        except Exception as e:
+            # Логируем ошибку для отладки
+            print(f"[Rule34Searcher] Error parsing Danbooru response: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+
+    async def _make_danbooru_request(self, url: str, params: dict = None) -> Optional[requests.Response]:
+        """Выполнить HTTP запрос к Danbooru с HTTP Basic Auth"""
+        def _request():
+            headers = {
+                "User-Agent": "Rule34Searcher/1.0 (by DubstepNamaz on Danbooru)",
+                "Accept": "application/json",
+            }
+            
+            try:
+                # Используем HTTP Basic Authentication
+                from requests.auth import HTTPBasicAuth
+                auth = HTTPBasicAuth('DubstepNamaz', '5qAAyDRZ22DFp8thwVXqGrfk')
+                
+                response = requests.get(url, params=params, headers=headers, auth=auth, timeout=10)
+                response.raise_for_status()
+                return response
+            except Exception as e:
+                print(f"[Rule34Searcher] Danbooru request failed: {e}")
+                raise e
+        
+        try:
+            return await utils.run_sync(_request)
+        except Exception as e:
+            print(f"[Rule34Searcher] _make_danbooru_request exception: {e}")
+            return None
 
     def _format_caption(self, post: Dict, requested_tags: str) -> str:
         """Форматирование подписи к посту"""
@@ -867,8 +997,14 @@ class Rule34Searcher(loader.Module):
             # Для "порно" не показываем технический тег в подписи
             display_tag = ""
         
-        # Поиск постов
-        posts = await self._search_rule34(search_tag, self.config["posts_count"])
+        # Выбираем источник из конфига
+        source = self.config["default_source"]
+        
+        # Поиск постов в зависимости от источника
+        if source == "danbooru":
+            posts = await self._search_danbooru(search_tag, self.config["posts_count"])
+        else:
+            posts = await self._search_rule34(search_tag, self.config["posts_count"])
         
         # Дополнительная фильтрация только видео если нужно
         if video_only and posts:
@@ -1174,4 +1310,36 @@ class Rule34Searcher(loader.Module):
         # API уже обработал фильтрацию, не нужно дополнительно фильтровать
         await self._send_posts(message, posts, tags, count)
 
+    @loader.command(
+        ru_doc="Поиск на Danbooru",
+        en_doc="Search on Danbooru",
+    )
+    async def danboorucmd(self, message: Message):
+        """[теги] [кол-во] - Поиск на Danbooru"""
+        # Проверяем вайтлист для команд
+        if not self._is_chat_allowed(message.peer_id):
+            chat_id_num = self._get_chat_id(message.peer_id)
+            await utils.answer(message, self.strings("chat_not_whitelisted").format(chat_id_num))
+            return
+        
+        args = utils.get_args_raw(message)
+        if not args:
+            await utils.answer(message, self.strings("usage_danbooru"))
+            return
+        
+        parts = args.rsplit(maxsplit=1)
+        count = self.config["send_count"]
+        
+        if len(parts) == 2 and parts[1].isdigit():
+            tags = parts[0]
+            count = min(int(parts[1]), 10)
+        else:
+            tags = args
+        
+        await utils.answer(message, self.strings("searching"))
+        
+        posts = await self._search_danbooru(tags, self.config["posts_count"])
+        
+        # API уже обработал фильтрацию, не нужно дополнительно фильтровать
+        await self._send_posts(message, posts, tags, count)
 
