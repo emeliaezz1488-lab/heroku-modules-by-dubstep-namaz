@@ -560,40 +560,14 @@ class Rule34Searcher(loader.Module):
         def _request():
             headers = get_request_headers(self.config["proxy_rotate_ua"])
             
-            # Сначала пробуем без прокси
+            # Один быстрый запрос без повторов
             try:
-                response = requests.get(url, params=params, headers=headers, timeout=10)
+                response = requests.get(url, params=params, headers=headers, timeout=5)
                 response.raise_for_status()
                 return response
             except Exception as e:
-                print(f"[Rule34Searcher] Request failed (no proxy): {e}")
-                # Если не удалось и включены прокси
-                if use_proxy and self.config["use_proxy"]:
-                    proxy_dict = self._get_working_proxy(url)
-                    if proxy_dict:
-                        try:
-                            response = requests.get(url, params=params, headers=headers, proxies=proxy_dict, timeout=10)
-                            response.raise_for_status()
-                            return response
-                        except Exception as e2:
-                            print(f"[Rule34Searcher] Request failed (with proxy): {e2}")
-                    # Пробуем еще раз без прокси
-                    try:
-                        response = requests.get(url, params=params, headers=headers, timeout=10)
-                        response.raise_for_status()
-                        return response
-                    except Exception as e3:
-                        print(f"[Rule34Searcher] Request failed (retry no proxy): {e3}")
-                        raise e3
-                else:
-                    # Пробуем еще раз без прокси
-                    try:
-                        response = requests.get(url, params=params, headers=headers, timeout=10)
-                        response.raise_for_status()
-                        return response
-                    except Exception as e4:
-                        print(f"[Rule34Searcher] Request failed (final retry): {e4}")
-                        raise e4
+                print(f"[Rule34Searcher] Request failed: {e}")
+                raise e
         
         try:
             return await utils.run_sync(_request)
@@ -1303,8 +1277,7 @@ class Rule34Searcher(loader.Module):
         else:
             tags = args
         
-        await utils.answer(message, self.strings("searching"))
-        
+        # Убрали сообщение "Ищем..." для ускорения
         posts = await self._search_rule34(tags, self.config["posts_count"])
         
         # API уже обработал фильтрацию, не нужно дополнительно фильтровать
@@ -1336,8 +1309,7 @@ class Rule34Searcher(loader.Module):
         else:
             tags = args
         
-        await utils.answer(message, self.strings("searching"))
-        
+        # Убрали сообщение "Ищем..." для ускорения
         posts = await self._search_danbooru(tags, self.config["posts_count"])
         
         # API уже обработал фильтрацию, не нужно дополнительно фильтровать
