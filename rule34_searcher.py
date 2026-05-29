@@ -801,8 +801,11 @@ class Rule34Searcher(loader.Module):
     async def _send_posts(self, message: Message, posts: List[Dict], requested_tags: str, count: int):
         """Отправка постов (изображения и видео)"""
         if not posts:
+            print(f"[Rule34Searcher] _send_posts: No posts provided")
             await utils.answer(message, self.strings("not_found"))
             return
+        
+        print(f"[Rule34Searcher] _send_posts: Received {len(posts)} posts, need to send {count}")
         
         # Перемешиваем посты для случайности
         random.shuffle(posts)
@@ -814,13 +817,14 @@ class Rule34Searcher(loader.Module):
         sent_count = 0
         sent_messages = []
         attempts = 0
-        max_attempts = min(len(posts), count * 10)  # Пробуем до 10x больше постов чем нужно
+        max_attempts = min(len(posts), count * 20)  # Увеличили до 20x
         
         for post in posts:
             if sent_count >= count:
                 break
                 
             if attempts >= max_attempts:
+                print(f"[Rule34Searcher] Reached max attempts ({max_attempts})")
                 break
                 
             attempts += 1
@@ -829,6 +833,12 @@ class Rule34Searcher(loader.Module):
             post_id = post.get("id", "")
             
             if not file_url:
+                print(f"[Rule34Searcher] Post {post_id} has no file_url")
+                continue
+            
+            # Проверяем не показывали ли недавно
+            if post_id in recent_ids:
+                print(f"[Rule34Searcher] Post {post_id} was recently shown, skipping")
                 continue
             
             caption = self._format_caption(post, requested_tags)
@@ -838,32 +848,17 @@ class Rule34Searcher(loader.Module):
                 file_ext = file_url.lower().split('?')[0].split('.')[-1]
                 is_video = file_ext in ['mp4', 'webm', 'gif', 'mov', 'avi', 'mkv']
                 
-                # Если включено скачивание перед отправкой
-                if self.config["download_before_send"]:
-                    file_data = await self._download_file(file_url)
-                    if not file_data:
-                        continue
-                    
-                    # Отправляем скачанный файл
-                    sent_msg = await message.client.send_file(
-                        message.peer_id,
-                        file_data,
-                        caption=caption,
-                        parse_mode="html",
-                        reply_to=getattr(message, "reply_to_msg_id", None),
-                        supports_streaming=is_video,
-                        attributes=[],  # Telegram сам определит тип
-                    )
-                else:
-                    # Отправляем файл по URL (быстрее)
-                    sent_msg = await message.client.send_file(
-                        message.peer_id,
-                        file_url,
-                        caption=caption,
-                        parse_mode="html",
-                        reply_to=getattr(message, "reply_to_msg_id", None),
-                        supports_streaming=is_video,
-                    )
+                print(f"[Rule34Searcher] Attempt {attempts}: Sending {file_ext} file (video={is_video}): {file_url[:80]}...")
+                
+                # Отправляем файл по URL (быстрее и надежнее)
+                sent_msg = await message.client.send_file(
+                    message.peer_id,
+                    file_url,
+                    caption=caption,
+                    parse_mode="html",
+                    reply_to=getattr(message, "reply_to_msg_id", None),
+                    supports_streaming=is_video,
+                )
                 
                 sent_messages.append(sent_msg)
                 sent_count += 1
@@ -871,18 +866,24 @@ class Rule34Searcher(loader.Module):
                 # Добавляем ID в список недавно показанных
                 if post_id:
                     recent_ids.append(post_id)
+                
+                print(f"[Rule34Searcher] Successfully sent post {post_id} ({sent_count}/{count})")
                     
             except Exception as e:
                 # Логируем ошибку для отладки
                 error_msg = str(e)
-                print(f"[Rule34Searcher] Error sending file {file_url[:50]}...: {error_msg}")
+                print(f"[Rule34Searcher] Error sending file {file_url[:80]}...: {error_msg}")
+                import traceback
+                traceback.print_exc()
                 
                 # Пропускаем этот пост и пробуем следующий
                 continue
         
+        print(f"[Rule34Searcher] Finished: sent {sent_count}/{count}, attempts {attempts}/{max_attempts}")
+        
         if sent_count == 0:
             # Более информативное сообщение об ошибке
-            await utils.answer(message, f"❌ Не удалось отправить медиа.\nНайдено постов: {len(posts)}\nПопыток отправки: {attempts}\n\nВозможные причины:\n• Файлы слишком большие\n• Telegram не может загрузить файлы\n• Все файлы битые")
+            await utils.answer(message, f"❌ Не удалось отправить медиа.\nНайдено постов: {len(posts)}\nПопыток отправки: {attempts}\n\nВозможные причины:\n• Файлы слишком большие\n• Telegram не может загрузить файлы\n• Все файлы битые\n• Все посты уже показывались")
         else:
             await message.delete()
             
