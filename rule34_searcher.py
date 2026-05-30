@@ -16,10 +16,13 @@
 Триггер-слова (автоматический поиск):
 - "фута" - поиск по тегу futa (картинки)
 - "фембой" - поиск по тегу femboy (картинки)
+- "фута" + "фембой" (или "фута+фембой") - видео по тегам futa femboy video
 - "порно" - случайное видео
+- "r34 [теги] [кол-во]" - поиск как у команды .r34 (без точки)
 """
 
 import random
+import re
 import requests
 import asyncio
 import json
@@ -952,7 +955,36 @@ class Rule34Searcher(loader.Module):
             chat_events.append(current_time)
             return False
 
-    async def _search_and_send_by_trigger(self, message: Message, search_tag: str, video_only: bool = False):
+    def _parse_tags_and_count(self, args: str) -> Tuple[str, int]:
+        """Разбор тегов и количества (последнее отдельное число — кол-во постов)."""
+        args = args.strip()
+        if not args:
+            return "", self.config["send_count"]
+
+        parts = args.rsplit(maxsplit=1)
+        count = self.config["send_count"]
+
+        if len(parts) == 2 and parts[1].isdigit():
+            tags = parts[0]
+            count = min(int(parts[1]), 10)
+        else:
+            tags = args
+
+        return tags, count
+
+    def _is_futa_femboy_combo(self, text_lower: str) -> bool:
+        """Триггер «фута+фембой»: оба слова или явная запись с плюсом."""
+        if "фута+фембой" in text_lower or "футафембой" in text_lower:
+            return True
+        return "фута" in text_lower and "фембой" in text_lower
+
+    async def _search_and_send_by_trigger(
+        self,
+        message: Message,
+        search_tag: str,
+        video_only: bool = False,
+        keep_search_tags: bool = False,
+    ):
         """Поиск и отправка по триггеру"""
         # Проверка на спам
         user_id = message.sender_id
@@ -965,7 +997,7 @@ class Rule34Searcher(loader.Module):
         display_tag = search_tag
         
         # Если нужны только видео, добавляем специальные теги для поиска
-        if video_only:
+        if video_only and not keep_search_tags:
             # Ищем с тегами video или animated для гарантии видео
             video_tags = ["video", "animated", "webm", "mp4"]
             search_tag = random.choice(video_tags)
@@ -1006,6 +1038,21 @@ class Rule34Searcher(loader.Module):
         # Отправка одного поста с правильным тегом для подписи
         await self._send_posts(message, posts, display_tag, 1)
 
+    async def _search_and_send_r34_chat(self, message: Message, args: str):
+        """Поиск по триггеру «r34 [теги] [кол-во]» в чате."""
+        user_id = message.sender_id
+        chat_id = message.peer_id
+
+        if await self._check_spam(user_id, chat_id):
+            return
+
+        tags, count = self._parse_tags_and_count(args)
+        if not tags:
+            return
+
+        posts = await self._search_rule34(tags, self.config["posts_count"])
+        await self._send_posts(message, posts, tags, count)
+
     @loader.watcher()
     async def watcher(self, message: Message):
         """Отслеживание триггер-слов"""
@@ -1035,8 +1082,24 @@ class Rule34Searcher(loader.Module):
             if "порно" in text_lower:
                 await self._search_and_send_by_trigger(message, "", video_only=True)
                 return
+
+            # «фута+фембой» — видео по futa + femboy (до одиночных триггеров)
+            if self._is_futa_femboy_combo(text_lower):
+                await self._search_and_send_by_trigger(
+                    message,
+                    "futa femboy video",
+                    video_only=True,
+                    keep_search_tags=True,
+                )
+                return
+
+            # «r34 теги [кол-во]» — как команда .r34
+            r34_match = re.match(r"^r34\s+(.+)$", message.text.strip(), re.IGNORECASE)
+            if r34_match:
+                await self._search_and_send_r34_chat(message, r34_match.group(1))
+                return
             
-            # Потом остальные триггеры
+            # Потом одиночные триггеры
             if "фута" in text_lower:
                 await self._search_and_send_by_trigger(message, "futa", video_only=False)
                 return
@@ -1269,14 +1332,7 @@ class Rule34Searcher(loader.Module):
             await utils.answer(message, self.strings("usage_r34"))
             return
         
-        parts = args.rsplit(maxsplit=1)
-        count = self.config["send_count"]
-        
-        if len(parts) == 2 and parts[1].isdigit():
-            tags = parts[0]
-            count = min(int(parts[1]), 10)
-        else:
-            tags = args
+        tags, count = self._parse_tags_and_count(args)
         
         # Убрали сообщение "Ищем..." для ускорения
         posts = await self._search_rule34(tags, self.config["posts_count"])
