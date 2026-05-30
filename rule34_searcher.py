@@ -2,7 +2,7 @@
 # meta banner: https://i.imgur.com/gallery/icon-of-rule34-FAzGMDE
 
 """
-Модуль для поиска изображений и видео на Rule34 и Danbooru.
+Модуль для поиска изображений и видео на Rule34, Danbooru и Pixiv.
 
 Это порт плагина с exteraGram для Heroku UserBot.
 
@@ -12,13 +12,15 @@
 Команды:
 - .r34 [теги] [кол-во] - поиск на Rule34
 - .danbooru [теги] [кол-во] - поиск на Danbooru
+- .pixiv [теги] [кол-во] - поиск на Pixiv (нужен refresh_token)
 
-Триггер-слова (автоматический поиск):
+Триггер-слова (автоматический поиск, источник — default_source в конфиге):
 - "фута" - поиск по тегу futa (картинки)
 - "фембой" - поиск по тегу femboy (картинки)
 - "фута" + "фембой" (или "фута+фембой") - видео по тегам futa femboy video
 - "порно" - случайное видео
-- "r34 [теги] [кол-во]" - поиск как у команды .r34 (без точки)
+- "r34 [теги] [кол-во]" - поиск Rule34 (без точки)
+- "pixiv [теги] [кол-во]" - поиск Pixiv (без точки)
 """
 
 import random
@@ -212,7 +214,7 @@ def localise(key: str, lang: str = "ru") -> str:
 
 @loader.tds
 class Rule34Searcher(loader.Module):
-    """Поиск изображений и видео на Rule34 и Danbooru"""
+    """Поиск изображений и видео на Rule34, Danbooru и Pixiv"""
     
     strings = {
         "name": "Rule34Searcher",
@@ -221,6 +223,9 @@ class Rule34Searcher(loader.Module):
         "error": "Ошибка: {}",
         "usage_r34": "Использование: .r34 [теги] [кол-во]\nПример: .r34 anime 2",
         "usage_danbooru": "Использование: .danbooru [теги] [кол-во]\nПример: .danbooru anime 2",
+        "usage_pixiv": "Использование: .pixiv [теги] [кол-во]\nПример: .pixiv 1girl 2",
+        "pixiv_no_token": "Pixiv: укажи refresh_token в настройках модуля (pixiv_refresh_token)",
+        "pixiv_error": "Ошибка Pixiv: {}",
         "proxy_update_started": "Обновление прокси началось...",
         "proxy_update_success": "Список прокси обновлен! Найдено {} рабочих прокси",
         "proxy_update_error": "Ошибка при обновлении прокси: {}",
@@ -259,6 +264,9 @@ class Rule34Searcher(loader.Module):
         "error": "Error: {}",
         "usage_r34": "Usage: .r34 [tags] [count]\nExample: .r34 anime 2",
         "usage_danbooru": "Usage: .danbooru [tags] [count]\nExample: .danbooru anime 2",
+        "usage_pixiv": "Usage: .pixiv [tags] [count]\nExample: .pixiv 1girl 2",
+        "pixiv_no_token": "Pixiv: set refresh_token in module config (pixiv_refresh_token)",
+        "pixiv_error": "Pixiv error: {}",
         "proxy_update_started": "Proxy update started...",
         "proxy_update_success": "Proxy list updated! Found {} working proxies",
         "proxy_update_error": "Proxy update error: {}",
@@ -398,11 +406,18 @@ class Rule34Searcher(loader.Module):
             loader.ConfigValue(
                 "default_source",
                 "rule34",
-                "Источник по умолчанию (rule34/danbooru)",
-                validator=loader.validators.Choice(["rule34", "danbooru"]),
+                "Источник по умолчанию (rule34/danbooru/pixiv)",
+                validator=loader.validators.Choice(["rule34", "danbooru", "pixiv"]),
+            ),
+            loader.ConfigValue(
+                "pixiv_refresh_token",
+                "",
+                "Pixiv refresh_token (из gppt / get_pixiv_token.py)",
+                validator=loader.validators.String(),
             ),
         )
         self._cache = {}
+        self._pixiv_api = None
         self._working_proxies = []
         self._proxy_file = "booru_proxies.json"
         
@@ -757,6 +772,147 @@ class Rule34Searcher(loader.Module):
             traceback.print_exc()
             return []
 
+    def _get_pixiv_refresh_token(self) -> str:
+        return (self.config.get("pixiv_refresh_token") or "").strip()
+
+    def _ensure_pixiv_api_sync(self):
+        from pixivpy3 import AppPixivAPI
+
+        refresh_token = self._get_pixiv_refresh_token()
+        if not refresh_token:
+            raise ValueError("pixiv_refresh_token_missing")
+
+        if self._pixiv_api is None:
+            api = AppPixivAPI()
+            api.auth(refresh_token=refresh_token)
+            self._pixiv_api = api
+        return self._pixiv_api
+
+    @staticmethod
+    def _pixiv_illust_url(illust) -> Optional[str]:
+        meta_pages = getattr(illust, "meta_pages", None) or []
+        if meta_pages:
+            urls = meta_pages[0].get("image_urls") if isinstance(meta_pages[0], dict) else getattr(
+                meta_pages[0], "image_urls", None
+            )
+            if urls:
+                if isinstance(urls, dict):
+                    return urls.get("large") or urls.get("medium") or urls.get("square_medium")
+                return getattr(urls, "large", None) or getattr(urls, "medium", None)
+
+        image_urls = getattr(illust, "image_urls", None)
+        if image_urls:
+            if isinstance(image_urls, dict):
+                return image_urls.get("large") or image_urls.get("medium") or image_urls.get("square_medium")
+            return getattr(image_urls, "large", None) or getattr(image_urls, "medium", None)
+        return None
+
+    def _search_pixiv_sync(self, tags: str, limit: int, video_only: bool = False) -> List[Dict]:
+        api = self._ensure_pixiv_api_sync()
+        word = tags.strip() if tags else ("うごイラ" if video_only else "1girl")
+
+        tag_key = f"pixiv_{word}" if word else "pixiv_random"
+        recent_ids = self._recent_posts[tag_key]
+        posts: List[Dict] = []
+        next_qs = {
+            "word": word,
+            "search_target": "partial_match_for_tags",
+            "sort": "date_desc",
+        }
+
+        while next_qs and len(posts) < limit:
+            result = api.search_illust(**next_qs)
+            illusts = getattr(result, "illusts", None) or []
+            if not illusts and isinstance(result, dict):
+                illusts = result.get("illusts", [])
+
+            for illust in illusts:
+                if len(posts) >= limit:
+                    break
+
+                post_id = str(getattr(illust, "id", "") or "")
+                if post_id and post_id in recent_ids:
+                    continue
+
+                illust_type = getattr(illust, "type", "") or ""
+                if video_only and illust_type != "ugoira":
+                    continue
+
+                file_url = self._pixiv_illust_url(illust)
+                if not file_url:
+                    continue
+
+                if file_url.lower().endswith(".zip"):
+                    continue
+
+                raw_tags = getattr(illust, "tags", None) or []
+                if isinstance(raw_tags, str):
+                    tags_list = raw_tags.split()
+                else:
+                    tags_list = list(raw_tags)
+
+                posts.append({
+                    "file_url": file_url,
+                    "tags": tags_list,
+                    "rating": str(getattr(illust, "x_restrict", "") or ""),
+                    "id": post_id,
+                    "media_type": illust_type,
+                })
+
+            next_qs = api.parse_qs(getattr(result, "next_url", None))
+            if not illusts:
+                break
+
+        return posts
+
+    async def _search_pixiv(self, tags: str, limit: int = 100, video_only: bool = False) -> List[Dict]:
+        if not self._get_pixiv_refresh_token():
+            print("[Rule34Searcher] Pixiv: refresh_token not configured")
+            return []
+
+        try:
+            return await utils.run_sync(
+                self._search_pixiv_sync,
+                tags,
+                min(limit, 100),
+                video_only,
+            )
+        except Exception as e:
+            print(f"[Rule34Searcher] Pixiv search error: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+
+    async def _search_posts(
+        self,
+        source: str,
+        tags: str,
+        limit: int,
+        video_only: bool = False,
+    ) -> List[Dict]:
+        if source == "danbooru":
+            posts = await self._search_danbooru(tags, limit)
+        elif source == "pixiv":
+            posts = await self._search_pixiv(tags, limit, video_only=video_only)
+        else:
+            posts = await self._search_rule34(tags, limit)
+
+        if video_only and posts and source != "pixiv":
+            video_posts = []
+            for post in posts:
+                file_url = post.get("file_url", "")
+                file_ext = file_url.lower().split("?")[0].split(".")[-1]
+                if file_ext in ["mp4", "webm", "mov", "avi", "mkv"]:
+                    video_posts.append(post)
+            if not video_posts:
+                for post in posts:
+                    file_url = post.get("file_url", "")
+                    if any(ext in file_url.lower() for ext in [".mp4", ".webm", ".mov", ".avi", ".mkv"]):
+                        video_posts.append(post)
+            posts = video_posts if video_posts else posts
+
+        return posts
+
     async def _make_danbooru_request(self, url: str, params: dict = None) -> Optional[requests.Response]:
         """Выполнить HTTP запрос к Danbooru с HTTP Basic Auth"""
         def _request():
@@ -816,6 +972,12 @@ class Rule34Searcher(loader.Module):
         # Ключ для отслеживания повторов
         tag_key = requested_tags.strip() if requested_tags.strip() else "random"
         recent_ids = self._recent_posts[tag_key]
+
+        # Сначала убираем команду/триггер, потом шлём медиа
+        try:
+            await message.delete()
+        except Exception:
+            pass
         
         sent_count = 0
         sent_messages = []
@@ -885,19 +1047,24 @@ class Rule34Searcher(loader.Module):
         print(f"[Rule34Searcher] Finished: sent {sent_count}/{count}, attempts {attempts}/{max_attempts}")
         
         if sent_count == 0:
-            # Более информативное сообщение об ошибке
-            await utils.answer(message, f"❌ Не удалось отправить медиа.\nНайдено постов: {len(posts)}\nПопыток отправки: {attempts}\n\nВозможные причины:\n• Файлы слишком большие\n• Telegram не может загрузить файлы\n• Все файлы битые\n• Все посты уже показывались")
-        else:
-            await message.delete()
-            
-            # Автоудаление если включено
-            if self.config["auto_delete"] and self.config["auto_delete_delay"] > 0:
-                await asyncio.sleep(self.config["auto_delete_delay"])
-                for msg in sent_messages:
-                    try:
-                        await msg.delete()
-                    except Exception:
-                        pass
+            err = (
+                f"❌ Не удалось отправить медиа.\nНайдено постов: {len(posts)}\n"
+                f"Попыток отправки: {attempts}\n\n"
+                "Возможные причины:\n• Файлы слишком большие\n"
+                "• Telegram не может загрузить файлы\n• Все файлы битые\n"
+                "• Все посты уже показывались"
+            )
+            try:
+                await message.client.send_message(message.peer_id, err)
+            except Exception:
+                pass
+        elif self.config["auto_delete"] and self.config["auto_delete_delay"] > 0:
+            await asyncio.sleep(self.config["auto_delete_delay"])
+            for msg in sent_messages:
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
 
     def _prune_spam_events(self, events, current_time, window):
         """Очистка старых событий спама"""
@@ -1004,34 +1171,17 @@ class Rule34Searcher(loader.Module):
             # Для "порно" не показываем технический тег в подписи
             display_tag = ""
         
-        # Выбираем источник из конфига
         source = self.config["default_source"]
-        
-        # Поиск постов в зависимости от источника
-        if source == "danbooru":
-            posts = await self._search_danbooru(search_tag, self.config["posts_count"])
-        else:
-            posts = await self._search_rule34(search_tag, self.config["posts_count"])
-        
-        # Дополнительная фильтрация только видео если нужно
-        if video_only and posts:
-            video_posts = []
-            for post in posts:
-                file_url = post.get("file_url", "")
-                file_ext = file_url.lower().split('?')[0].split('.')[-1]
-                if file_ext in ['mp4', 'webm', 'mov', 'avi', 'mkv']:
-                    video_posts.append(post)
-            
-            # Если после фильтрации ничего не осталось, пробуем еще раз с другим тегом
-            if not video_posts and posts:
-                # Пробуем найти хоть что-то с расширением видео
-                for post in posts:
-                    file_url = post.get("file_url", "")
-                    if any(ext in file_url.lower() for ext in ['.mp4', '.webm', '.mov', '.avi', '.mkv']):
-                        video_posts.append(post)
-            
-            posts = video_posts if video_posts else posts
-        
+        if source == "pixiv" and not self._get_pixiv_refresh_token():
+            return
+
+        posts = await self._search_posts(
+            source,
+            search_tag,
+            self.config["posts_count"],
+            video_only=video_only,
+        )
+
         if not posts:
             return
         
@@ -1051,6 +1201,24 @@ class Rule34Searcher(loader.Module):
             return
 
         posts = await self._search_rule34(tags, self.config["posts_count"])
+        await self._send_posts(message, posts, tags, count)
+
+    async def _search_and_send_pixiv_chat(self, message: Message, args: str):
+        """Поиск по триггеру «pixiv [теги] [кол-во]» в чате."""
+        user_id = message.sender_id
+        chat_id = message.peer_id
+
+        if await self._check_spam(user_id, chat_id):
+            return
+
+        if not self._get_pixiv_refresh_token():
+            return
+
+        tags, count = self._parse_tags_and_count(args)
+        if not tags:
+            return
+
+        posts = await self._search_pixiv(tags, self.config["posts_count"])
         await self._send_posts(message, posts, tags, count)
 
     @loader.watcher()
@@ -1097,6 +1265,12 @@ class Rule34Searcher(loader.Module):
             r34_match = re.match(r"^r34\s+(.+)$", message.text.strip(), re.IGNORECASE)
             if r34_match:
                 await self._search_and_send_r34_chat(message, r34_match.group(1))
+                return
+
+            # «pixiv теги [кол-во]» — как команда .pixiv
+            pixiv_match = re.match(r"^pixiv\s+(.+)$", message.text.strip(), re.IGNORECASE)
+            if pixiv_match:
+                await self._search_and_send_pixiv_chat(message, pixiv_match.group(1))
                 return
             
             # Потом одиночные триггеры
@@ -1357,18 +1531,38 @@ class Rule34Searcher(loader.Module):
             await utils.answer(message, self.strings("usage_danbooru"))
             return
         
-        parts = args.rsplit(maxsplit=1)
-        count = self.config["send_count"]
+        tags, count = self._parse_tags_and_count(args)
         
-        if len(parts) == 2 and parts[1].isdigit():
-            tags = parts[0]
-            count = min(int(parts[1]), 10)
-        else:
-            tags = args
-        
-        # Убрали сообщение "Ищем..." для ускорения
         posts = await self._search_danbooru(tags, self.config["posts_count"])
-        
-        # API уже обработал фильтрацию, не нужно дополнительно фильтровать
+        await self._send_posts(message, posts, tags, count)
+
+    @loader.command(
+        ru_doc="Поиск на Pixiv",
+        en_doc="Search on Pixiv",
+    )
+    async def pixivcmd(self, message: Message):
+        """[теги] [кол-во] - Поиск на Pixiv"""
+        if not self._is_chat_allowed(message.peer_id):
+            chat_id_num = self._get_chat_id(message.peer_id)
+            await utils.answer(message, self.strings("chat_not_whitelisted").format(chat_id_num))
+            return
+
+        if not self._get_pixiv_refresh_token():
+            await utils.answer(message, self.strings("pixiv_no_token"))
+            return
+
+        args = utils.get_args_raw(message)
+        if not args:
+            await utils.answer(message, self.strings("usage_pixiv"))
+            return
+
+        tags, count = self._parse_tags_and_count(args)
+
+        try:
+            posts = await self._search_pixiv(tags, self.config["posts_count"])
+        except Exception as e:
+            await utils.answer(message, self.strings("pixiv_error").format(str(e)))
+            return
+
         await self._send_posts(message, posts, tags, count)
 
