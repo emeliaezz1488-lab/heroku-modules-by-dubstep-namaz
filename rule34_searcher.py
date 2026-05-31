@@ -419,6 +419,9 @@ class Rule34Searcher(loader.Module):
         self._cache = {}
         self._pixiv_api = None
         self._pixiv_token_cached = ""
+        self._pixiv_auth_at = 0.0
+        self._pixiv_refresh_task = None
+        self.PIXIV_ACCESS_TTL = 3000  # access_token ~1ч, обновляем заранее
         self._working_proxies = []
         self._proxy_file = "booru_proxies.json"
         
@@ -456,6 +459,23 @@ class Rule34Searcher(loader.Module):
         self._chat_whitelist = set(self._db.get(__name__, "chat_whitelist", []))
         if self._get_pixiv_refresh_token():
             asyncio.create_task(self._warm_pixiv_api())
+            self._pixiv_refresh_task = asyncio.create_task(self._pixiv_token_refresh_loop())
+
+    async def on_unload(self):
+        if self._pixiv_refresh_task and not self._pixiv_refresh_task.done():
+            self._pixiv_refresh_task.cancel()
+
+    async def _pixiv_token_refresh_loop(self):
+        """Фоновое обновление access_token, чтобы Pixiv не отваливался через ~1 час."""
+        while True:
+            try:
+                await asyncio.sleep(self.PIXIV_ACCESS_TTL)
+                await utils.run_sync(lambda: self._ensure_pixiv_api_sync(force_refresh=True))
+                print("[Rule34Searcher] Pixiv access_token refreshed")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"[Rule34Searcher] Pixiv background refresh failed: {e}")
 
     async def _warm_pixiv_api(self):
         """Заранее авторизоваться в Pixiv, чтобы первая команда не ждала auth."""
@@ -783,7 +803,17 @@ class Rule34Searcher(loader.Module):
             return []
 
     def _get_pixiv_refresh_token(self) -> str:
-        return (self.config.get("pixiv_refresh_token") or "").strip()
+        config_token = (self.config.get("pixiv_refresh_token") or "").strip()
+        db_token = ""
+        if getattr(self, "_db", None):
+            db_token = (self._db.get(__name__, "pixiv_refresh_token_active", "") or "").strip()
+        return db_token or config_token
+
+    def _save_pixiv_refresh_token(self, refresh_token: str):
+        token = (refresh_token or "").strip()
+        if not token or not getattr(self, "_db", None):
+            return
+        self._db.set(__name__, "pixiv_refresh_token_active", token)
 
     def _pixiv_fetch_limit(self, send_count: int) -> int:
         """Pixiv отдаёт ~30 работ за запрос — не качаем лишние страницы."""
@@ -792,22 +822,51 @@ class Rule34Searcher(loader.Module):
     def _reset_pixiv_api(self):
         self._pixiv_api = None
         self._pixiv_token_cached = ""
+        self._pixiv_auth_at = 0.0
 
-    def _ensure_pixiv_api_sync(self):
+    def _ensure_pixiv_api_sync(self, force_refresh: bool = False):
         from pixivpy3 import AppPixivAPI
 
         refresh_token = self._get_pixiv_refresh_token()
         if not refresh_token:
             raise ValueError("pixiv_refresh_token_missing")
 
-        if self._pixiv_api is not None and self._pixiv_token_cached == refresh_token:
+        now = time.time()
+        auth_expired = (now - self._pixiv_auth_at) >= self.PIXIV_ACCESS_TTL
+        need_auth = (
+            force_refresh
+            or self._pixiv_api is None
+            or self._pixiv_token_cached != refresh_token
+            or auth_expired
+        )
+
+        if not need_auth:
             return self._pixiv_api
 
-        api = AppPixivAPI(timeout=12)
-        api.auth(refresh_token=refresh_token)
-        self._pixiv_api = api
-        self._pixiv_token_cached = refresh_token
+        if self._pixiv_api is None:
+            self._pixiv_api = AppPixivAPI(timeout=12)
+
+        self._pixiv_api.auth(refresh_token=refresh_token)
+        new_refresh = getattr(self._pixiv_api, "refresh_token", None)
+        if new_refresh:
+            self._save_pixiv_refresh_token(new_refresh)
+
+        self._pixiv_token_cached = self._get_pixiv_refresh_token()
+        self._pixiv_auth_at = now
         return self._pixiv_api
+
+    @staticmethod
+    def _pixiv_validate_result(result) -> None:
+        if result is None:
+            raise ValueError("pixiv_empty_response")
+
+        if isinstance(result, dict):
+            if result.get("error") or result.get("has_error"):
+                raise ValueError(f"pixiv_api_error: {result.get('error', result)}")
+
+        for attr in ("error", "has_error", "errors"):
+            if getattr(result, attr, None):
+                raise ValueError(f"pixiv_api_error: {getattr(result, attr)}")
 
     @staticmethod
     def _pixiv_illust_url(illust) -> Optional[str]:
@@ -851,6 +910,7 @@ class Rule34Searcher(loader.Module):
         while next_qs and len(posts) < limit and pages < max_pages:
             pages += 1
             result = api.search_illust(**next_qs)
+            self._pixiv_validate_result(result)
             illusts = getattr(result, "illusts", None) or []
             if not illusts and isinstance(result, dict):
                 illusts = result.get("illusts", [])
@@ -912,7 +972,7 @@ class Rule34Searcher(loader.Module):
 
         def _run_search():
             last_error = None
-            for attempt in range(2):
+            for attempt in range(3):
                 try:
                     return self._search_pixiv_sync(
                         tags,
@@ -923,6 +983,11 @@ class Rule34Searcher(loader.Module):
                     last_error = e
                     print(f"[Rule34Searcher] Pixiv search attempt {attempt + 1} failed: {e}")
                     self._reset_pixiv_api()
+                    if attempt < 2:
+                        try:
+                            self._ensure_pixiv_api_sync(force_refresh=True)
+                        except Exception as auth_err:
+                            print(f"[Rule34Searcher] Pixiv re-auth failed: {auth_err}")
             if last_error:
                 raise last_error
             return []
