@@ -418,6 +418,7 @@ class Rule34Searcher(loader.Module):
         )
         self._cache = {}
         self._pixiv_api = None
+        self._pixiv_token_cached = ""
         self._working_proxies = []
         self._proxy_file = "booru_proxies.json"
         
@@ -453,6 +454,15 @@ class Rule34Searcher(loader.Module):
         self._db = db
         # Загружаем вайтлист из БД
         self._chat_whitelist = set(self._db.get(__name__, "chat_whitelist", []))
+        if self._get_pixiv_refresh_token():
+            asyncio.create_task(self._warm_pixiv_api())
+
+    async def _warm_pixiv_api(self):
+        """Заранее авторизоваться в Pixiv, чтобы первая команда не ждала auth."""
+        try:
+            await utils.run_sync(self._ensure_pixiv_api_sync)
+        except Exception as e:
+            print(f"[Rule34Searcher] Pixiv warm-up failed: {e}")
 
     def _get_chat_id(self, peer_id) -> int:
         """Получить числовой ID чата из объекта Peer"""
@@ -775,6 +785,14 @@ class Rule34Searcher(loader.Module):
     def _get_pixiv_refresh_token(self) -> str:
         return (self.config.get("pixiv_refresh_token") or "").strip()
 
+    def _pixiv_fetch_limit(self, send_count: int) -> int:
+        """Pixiv отдаёт ~30 работ за запрос — не качаем лишние страницы."""
+        return min(max(int(send_count) * 10, 12), 30)
+
+    def _reset_pixiv_api(self):
+        self._pixiv_api = None
+        self._pixiv_token_cached = ""
+
     def _ensure_pixiv_api_sync(self):
         from pixivpy3 import AppPixivAPI
 
@@ -782,10 +800,13 @@ class Rule34Searcher(loader.Module):
         if not refresh_token:
             raise ValueError("pixiv_refresh_token_missing")
 
-        if self._pixiv_api is None:
-            api = AppPixivAPI()
-            api.auth(refresh_token=refresh_token)
-            self._pixiv_api = api
+        if self._pixiv_api is not None and self._pixiv_token_cached == refresh_token:
+            return self._pixiv_api
+
+        api = AppPixivAPI(timeout=12)
+        api.auth(refresh_token=refresh_token)
+        self._pixiv_api = api
+        self._pixiv_token_cached = refresh_token
         return self._pixiv_api
 
     @staticmethod
@@ -797,17 +818,23 @@ class Rule34Searcher(loader.Module):
             )
             if urls:
                 if isinstance(urls, dict):
-                    return urls.get("large") or urls.get("medium") or urls.get("square_medium")
-                return getattr(urls, "large", None) or getattr(urls, "medium", None)
+                    return urls.get("medium") or urls.get("large") or urls.get("square_medium")
+                return getattr(urls, "medium", None) or getattr(urls, "large", None)
 
         image_urls = getattr(illust, "image_urls", None)
         if image_urls:
             if isinstance(image_urls, dict):
-                return image_urls.get("large") or image_urls.get("medium") or image_urls.get("square_medium")
-            return getattr(image_urls, "large", None) or getattr(image_urls, "medium", None)
+                return image_urls.get("medium") or image_urls.get("large") or image_urls.get("square_medium")
+            return getattr(image_urls, "medium", None) or getattr(image_urls, "large", None)
         return None
 
-    def _search_pixiv_sync(self, tags: str, limit: int, video_only: bool = False) -> List[Dict]:
+    def _search_pixiv_sync(
+        self,
+        tags: str,
+        limit: int,
+        video_only: bool = False,
+        max_pages: int = 2,
+    ) -> List[Dict]:
         api = self._ensure_pixiv_api_sync()
         word = tags.strip() if tags else ("うごイラ" if video_only else "1girl")
 
@@ -819,8 +846,10 @@ class Rule34Searcher(loader.Module):
             "search_target": "partial_match_for_tags",
             "sort": "date_desc",
         }
+        pages = 0
 
-        while next_qs and len(posts) < limit:
+        while next_qs and len(posts) < limit and pages < max_pages:
+            pages += 1
             result = api.search_illust(**next_qs)
             illusts = getattr(result, "illusts", None) or []
             if not illusts and isinstance(result, dict):
@@ -859,24 +888,47 @@ class Rule34Searcher(loader.Module):
                     "media_type": illust_type,
                 })
 
+            if len(posts) >= limit:
+                break
+
             next_qs = api.parse_qs(getattr(result, "next_url", None))
             if not illusts:
                 break
 
         return posts
 
-    async def _search_pixiv(self, tags: str, limit: int = 100, video_only: bool = False) -> List[Dict]:
+    async def _search_pixiv(
+        self,
+        tags: str,
+        limit: Optional[int] = None,
+        video_only: bool = False,
+        send_count: int = 1,
+    ) -> List[Dict]:
         if not self._get_pixiv_refresh_token():
             print("[Rule34Searcher] Pixiv: refresh_token not configured")
             return []
 
+        fetch_limit = limit if limit is not None else self._pixiv_fetch_limit(send_count)
+
+        def _run_search():
+            last_error = None
+            for attempt in range(2):
+                try:
+                    return self._search_pixiv_sync(
+                        tags,
+                        min(fetch_limit, 30),
+                        video_only,
+                    )
+                except Exception as e:
+                    last_error = e
+                    print(f"[Rule34Searcher] Pixiv search attempt {attempt + 1} failed: {e}")
+                    self._reset_pixiv_api()
+            if last_error:
+                raise last_error
+            return []
+
         try:
-            return await utils.run_sync(
-                self._search_pixiv_sync,
-                tags,
-                min(limit, 100),
-                video_only,
-            )
+            return await utils.run_sync(_run_search)
         except Exception as e:
             print(f"[Rule34Searcher] Pixiv search error: {e}")
             import traceback
@@ -889,11 +941,12 @@ class Rule34Searcher(loader.Module):
         tags: str,
         limit: int,
         video_only: bool = False,
+        send_count: int = 1,
     ) -> List[Dict]:
         if source == "danbooru":
             posts = await self._search_danbooru(tags, limit)
         elif source == "pixiv":
-            posts = await self._search_pixiv(tags, limit, video_only=video_only)
+            posts = await self._search_pixiv(tags, video_only=video_only, send_count=send_count)
         else:
             posts = await self._search_rule34(tags, limit)
 
@@ -972,12 +1025,6 @@ class Rule34Searcher(loader.Module):
         # Ключ для отслеживания повторов
         tag_key = requested_tags.strip() if requested_tags.strip() else "random"
         recent_ids = self._recent_posts[tag_key]
-
-        # Сначала убираем команду/триггер, потом шлём медиа
-        try:
-            await message.delete()
-        except Exception:
-            pass
         
         sent_count = 0
         sent_messages = []
@@ -1047,24 +1094,24 @@ class Rule34Searcher(loader.Module):
         print(f"[Rule34Searcher] Finished: sent {sent_count}/{count}, attempts {attempts}/{max_attempts}")
         
         if sent_count == 0:
-            err = (
+            await utils.answer(
+                message,
                 f"❌ Не удалось отправить медиа.\nНайдено постов: {len(posts)}\n"
                 f"Попыток отправки: {attempts}\n\n"
                 "Возможные причины:\n• Файлы слишком большие\n"
                 "• Telegram не может загрузить файлы\n• Все файлы битые\n"
-                "• Все посты уже показывались"
+                "• Все посты уже показывались",
             )
-            try:
-                await message.client.send_message(message.peer_id, err)
-            except Exception:
-                pass
-        elif self.config["auto_delete"] and self.config["auto_delete_delay"] > 0:
-            await asyncio.sleep(self.config["auto_delete_delay"])
-            for msg in sent_messages:
-                try:
-                    await msg.delete()
-                except Exception:
-                    pass
+        else:
+            await message.delete()
+
+            if self.config["auto_delete"] and self.config["auto_delete_delay"] > 0:
+                await asyncio.sleep(self.config["auto_delete_delay"])
+                for msg in sent_messages:
+                    try:
+                        await msg.delete()
+                    except Exception:
+                        pass
 
     def _prune_spam_events(self, events, current_time, window):
         """Очистка старых событий спама"""
@@ -1180,6 +1227,7 @@ class Rule34Searcher(loader.Module):
             search_tag,
             self.config["posts_count"],
             video_only=video_only,
+            send_count=1,
         )
 
         if not posts:
@@ -1218,7 +1266,7 @@ class Rule34Searcher(loader.Module):
         if not tags:
             return
 
-        posts = await self._search_pixiv(tags, self.config["posts_count"])
+        posts = await self._search_pixiv(tags, send_count=count)
         await self._send_posts(message, posts, tags, count)
 
     @loader.watcher()
@@ -1559,7 +1607,7 @@ class Rule34Searcher(loader.Module):
         tags, count = self._parse_tags_and_count(args)
 
         try:
-            posts = await self._search_pixiv(tags, self.config["posts_count"])
+            posts = await self._search_pixiv(tags, send_count=count)
         except Exception as e:
             await utils.answer(message, self.strings("pixiv_error").format(str(e)))
             return
