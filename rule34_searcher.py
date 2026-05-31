@@ -13,6 +13,8 @@
 - .r34 [теги] [кол-во] - поиск на Rule34
 - .danbooru [теги] [кол-во] - поиск на Danbooru
 - .pixiv [теги] [кол-во] - поиск на Pixiv (нужен refresh_token)
+- .pixivnsfw [теги] [кол-во] - Pixiv R-18
+- .pixivmanga [теги] - R-18 манга Pixiv в Telegraph
 
 Триггер-слова (автоматический поиск, источник — default_source в конфиге):
 - "фута" - поиск по тегу futa (картинки)
@@ -21,10 +23,15 @@
 - "порно" - случайное видео
 - "r34 [теги] [кол-во]" - поиск Rule34 (без точки)
 - "pixiv [теги] [кол-во]" - поиск Pixiv (без точки)
+- "pixivnsfw [теги] [кол-во]" - Pixiv R-18 (без точки)
+- "pixivmanga [теги]" - R-18 манга Pixiv в Telegraph (без точки)
 """
 
 import random
 import re
+import io
+import os
+import tempfile
 import requests
 import asyncio
 import json
@@ -37,6 +44,15 @@ from typing import List, Dict, Optional, Tuple
 from collections import defaultdict, deque
 from herokutl.types import Message
 from .. import loader, utils
+
+PIXIV_REFERER = "https://www.pixiv.net/"
+TELEGRAPH_API = "https://api.telegra.ph"
+TELEGRAPH_UPLOAD = "https://telegra.ph/upload"
+TELEGRAPH_UPLOAD_URLS = (
+    "https://telegra.ph/upload",
+    "https://graph.org/upload",
+)
+TELEGRAPH_MAX_BYTES = 5 * 1024 * 1024
 
 # User-Agent список для ротации
 USER_AGENTS = [
@@ -224,8 +240,15 @@ class Rule34Searcher(loader.Module):
         "usage_r34": "Использование: .r34 [теги] [кол-во]\nПример: .r34 anime 2",
         "usage_danbooru": "Использование: .danbooru [теги] [кол-во]\nПример: .danbooru anime 2",
         "usage_pixiv": "Использование: .pixiv [теги] [кол-во]\nПример: .pixiv 1girl 2",
+        "usage_pixiv_nsfw": "Использование: .pixivnsfw [теги] [кол-во]\nПример: .pixivnsfw femboy 2",
+        "usage_pixiv_manga": "Использование: .pixivmanga [теги]\nПример: .pixivmanga futanari\n(только R-18 манга)",
+        "pixiv_manga_creating": "Собираю мангу в Telegraph...",
+        "pixiv_manga_ready": "📖 <b>{}</b>\n📄 <a href=\"{}\">Telegraph</a> ({} стр.)",
         "pixiv_no_token": "Pixiv: укажи refresh_token в настройках модуля (pixiv_refresh_token)",
         "pixiv_error": "Ошибка Pixiv: {}",
+        "pixiv_manga_need_pillow": "Для манги нужен Pillow на сервере: pip install Pillow",
+        "pixiv_manga_album": "📖 <b>{}</b> ({} стр.)\n<i>Telegraph с сервера недоступен — отправлено альбомом</i>",
+        "pixiv_manga_album_plain": "📖 <b>{}</b> ({} стр.)",
         "proxy_update_started": "Обновление прокси началось...",
         "proxy_update_success": "Список прокси обновлен! Найдено {} рабочих прокси",
         "proxy_update_error": "Ошибка при обновлении прокси: {}",
@@ -265,8 +288,15 @@ class Rule34Searcher(loader.Module):
         "usage_r34": "Usage: .r34 [tags] [count]\nExample: .r34 anime 2",
         "usage_danbooru": "Usage: .danbooru [tags] [count]\nExample: .danbooru anime 2",
         "usage_pixiv": "Usage: .pixiv [tags] [count]\nExample: .pixiv 1girl 2",
+        "usage_pixiv_nsfw": "Usage: .pixivnsfw [tags] [count]\nExample: .pixivnsfw femboy 2",
+        "usage_pixiv_manga": "Usage: .pixivmanga [tags]\nExample: .pixivmanga futanari\n(R-18 manga only)",
+        "pixiv_manga_creating": "Building manga Telegraph page...",
+        "pixiv_manga_ready": "📖 <b>{}</b>\n📄 <a href=\"{}\">Telegraph</a> ({} pages)",
         "pixiv_no_token": "Pixiv: set refresh_token in module config (pixiv_refresh_token)",
         "pixiv_error": "Pixiv error: {}",
+        "pixiv_manga_need_pillow": "Pixiv manga requires Pillow: pip install Pillow",
+        "pixiv_manga_album": "📖 <b>{}</b> ({} pages)\n<i>Telegraph blocked from server — sent as album</i>",
+        "pixiv_manga_album_plain": "📖 <b>{}</b> ({} pages)",
         "proxy_update_started": "Proxy update started...",
         "proxy_update_success": "Proxy list updated! Found {} working proxies",
         "proxy_update_error": "Proxy update error: {}",
@@ -415,6 +445,36 @@ class Rule34Searcher(loader.Module):
                 "Pixiv refresh_token (из gppt / get_pixiv_token.py)",
                 validator=loader.validators.String(),
             ),
+            loader.ConfigValue(
+                "pixiv_manga_max_pages",
+                40,
+                "Макс. страниц манги в Telegraph",
+                validator=loader.validators.Integer(minimum=2, maximum=100),
+            ),
+            loader.ConfigValue(
+                "pixiv_manga_album_only",
+                True,
+                "Манга только альбомом (без Telegraph; для Heroku)",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "telegraph_use_proxy",
+                True,
+                "Прокси для Telegraph upload (если album_only выкл.)",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "telegraph_auto_delete",
+                True,
+                "Автоудаление сообщений со ссылкой Telegraph",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "telegraph_delete_delay",
+                120,
+                "Задержка автоудаления Telegraph (сек, 0=выкл)",
+                validator=loader.validators.Integer(minimum=0),
+            ),
         )
         self._cache = {}
         self._pixiv_api = None
@@ -437,6 +497,7 @@ class Rule34Searcher(loader.Module):
         self._spam_blocks = {}
         self._chat_spam_blocks = {}
         self._spam_lock = asyncio.Lock()
+        self._telegraph_upload_blocked = False
         
         self.SPAM_LIMIT = 3
         self.SPAM_WINDOW = 3
@@ -869,23 +930,253 @@ class Rule34Searcher(loader.Module):
                 raise ValueError(f"pixiv_api_error: {getattr(result, attr)}")
 
     @staticmethod
-    def _pixiv_illust_url(illust) -> Optional[str]:
+    def _pixiv_image_urls_to_url(image_urls, *, for_telegraph: bool = False) -> Optional[str]:
+        if not image_urls:
+            return None
+        if isinstance(image_urls, dict):
+            if for_telegraph:
+                return (
+                    image_urls.get("large")
+                    or image_urls.get("original")
+                    or image_urls.get("medium")
+                    or image_urls.get("square_medium")
+                )
+            return (
+                image_urls.get("medium")
+                or image_urls.get("large")
+                or image_urls.get("square_medium")
+                or image_urls.get("original")
+            )
+        if for_telegraph:
+            return (
+                getattr(image_urls, "large", None)
+                or getattr(image_urls, "original", None)
+                or getattr(image_urls, "medium", None)
+                or getattr(image_urls, "square_medium", None)
+            )
+        return (
+            getattr(image_urls, "medium", None)
+            or getattr(image_urls, "large", None)
+            or getattr(image_urls, "square_medium", None)
+            or getattr(image_urls, "original", None)
+        )
+
+    @staticmethod
+    def _pixiv_illust_url(illust, *, for_telegraph: bool = False) -> Optional[str]:
         meta_pages = getattr(illust, "meta_pages", None) or []
         if meta_pages:
             urls = meta_pages[0].get("image_urls") if isinstance(meta_pages[0], dict) else getattr(
                 meta_pages[0], "image_urls", None
             )
-            if urls:
-                if isinstance(urls, dict):
-                    return urls.get("medium") or urls.get("large") or urls.get("square_medium")
-                return getattr(urls, "medium", None) or getattr(urls, "large", None)
+            return Rule34Searcher._pixiv_image_urls_to_url(urls, for_telegraph=for_telegraph)
 
-        image_urls = getattr(illust, "image_urls", None)
-        if image_urls:
-            if isinstance(image_urls, dict):
-                return image_urls.get("medium") or image_urls.get("large") or image_urls.get("square_medium")
-            return getattr(image_urls, "medium", None) or getattr(image_urls, "large", None)
-        return None
+        return Rule34Searcher._pixiv_image_urls_to_url(
+            getattr(illust, "image_urls", None),
+            for_telegraph=for_telegraph,
+        )
+
+    @classmethod
+    def _pixiv_all_page_urls(cls, illust, *, for_telegraph: bool = False) -> List[str]:
+        urls: List[str] = []
+        meta_pages = getattr(illust, "meta_pages", None) or []
+        for page in meta_pages:
+            image_urls = page.get("image_urls") if isinstance(page, dict) else getattr(page, "image_urls", None)
+            url = cls._pixiv_image_urls_to_url(image_urls, for_telegraph=for_telegraph)
+            if url and not url.lower().endswith(".zip"):
+                urls.append(url)
+
+        if not urls:
+            single = cls._pixiv_illust_url(illust, for_telegraph=for_telegraph)
+            if single:
+                urls.append(single)
+        return urls
+
+    def _prepare_telegraph_image(self, image_data: bytes) -> bytes:
+        """Привести любую картинку Pixiv к JPEG для telegra.ph/upload."""
+        if not image_data:
+            raise ValueError("empty_image")
+
+        lower = image_data[:256].lower()
+        if lower.startswith(b"<!doctype") or lower.startswith(b"<html") or b"<body" in lower:
+            raise ValueError("pixiv_returned_html_not_image")
+
+        try:
+            from PIL import Image
+        except ImportError as e:
+            raise ValueError("pillow_required_for_pixiv_manga") from e
+
+        img = Image.open(io.BytesIO(image_data))
+        img.load()
+
+        try:
+            resample = Image.Resampling.LANCZOS
+        except AttributeError:
+            resample = Image.LANCZOS
+
+        if img.mode in ("RGBA", "LA"):
+            background = Image.new("RGB", img.size, (255, 255, 255))
+            background.paste(img, mask=img.split()[-1])
+            img = background
+        elif img.mode == "P":
+            img = img.convert("RGB")
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+
+        max_side = 1600
+        if max(img.size) > max_side:
+            img.thumbnail((max_side, max_side), resample)
+
+        quality = 88
+        while quality >= 55:
+            out = io.BytesIO()
+            img.save(out, format="JPEG", quality=quality, optimize=True)
+            jpeg_data = out.getvalue()
+            if len(jpeg_data) <= TELEGRAPH_MAX_BYTES - 65536:
+                return jpeg_data
+            quality -= 8
+
+        img.thumbnail((1200, 1200), resample)
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=75, optimize=True)
+        jpeg_data = out.getvalue()
+        if len(jpeg_data) > TELEGRAPH_MAX_BYTES:
+            raise ValueError("image_too_large_for_telegraph")
+        return jpeg_data
+
+    def _pixiv_manga_skip_telegraph(self) -> bool:
+        return bool(
+            self.config.get("pixiv_manga_album_only")
+            or self._telegraph_upload_blocked
+        )
+
+    def _mark_telegraph_blocked(self):
+        if not self._telegraph_upload_blocked:
+            print(
+                "[Rule34Searcher] Telegraph upload blocked from this server "
+                "(HTTP 400). Pixiv manga will use Telegram albums."
+            )
+        self._telegraph_upload_blocked = True
+
+    def _telegraph_request_kwargs_sync(self) -> dict:
+        kwargs = {
+            "timeout": 90,
+            "headers": {
+                "User-Agent": USER_AGENTS[0],
+                "Accept": "*/*",
+            },
+        }
+        use_proxy = self.config.get("use_proxy") or self.config.get("telegraph_use_proxy")
+        if use_proxy:
+            proxy = self._get_working_proxy("https://telegra.ph/")
+            if proxy:
+                kwargs["proxies"] = proxy
+        return kwargs
+
+    @staticmethod
+    def _telegraph_parse_upload_response(response: requests.Response) -> str:
+        if response.status_code >= 400:
+            raise ValueError(f"http_{response.status_code}:{response.text[:200]}")
+
+        try:
+            payload = response.json()
+        except Exception:
+            raise ValueError(f"bad_json:{response.text[:200]}")
+
+        if isinstance(payload, dict) and payload.get("error"):
+            raise ValueError(str(payload["error"]))
+
+        if isinstance(payload, list) and payload:
+            if payload[0].get("error"):
+                raise ValueError(str(payload[0]["error"]))
+            if payload[0].get("src"):
+                return payload[0]["src"]
+
+        raise ValueError(str(payload))
+
+    def _telegraph_upload_lib_sync(self, jpeg_data: bytes) -> str:
+        from telegraph import Telegraph
+
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp.write(jpeg_data)
+            tmp_path = tmp.name
+
+        try:
+            result = Telegraph().upload_file(tmp_path)
+            if isinstance(result, list) and result and result[0].get("src"):
+                return result[0]["src"]
+            raise ValueError(str(result))
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    def _telegraph_upload_jpeg_sync(self, jpeg_data: bytes, *, quick: bool = False) -> str:
+        if self._telegraph_upload_blocked:
+            raise ValueError("telegraph_blocked")
+
+        errors: List[str] = []
+
+        try:
+            return self._telegraph_upload_lib_sync(jpeg_data)
+        except Exception as e:
+            errors.append(f"lib:{e}")
+
+        req_kwargs = self._telegraph_request_kwargs_sync()
+        upload_urls = TELEGRAPH_UPLOAD_URLS[:1] if quick else TELEGRAPH_UPLOAD_URLS
+        attempts = [
+            ("file_bytesio", lambda: self._telegraph_files_bytesio(jpeg_data)),
+        ]
+        if not quick:
+            attempts.extend(
+                [
+                    ("file_temp", lambda: self._telegraph_files_tempfile(jpeg_data)),
+                    ("file0_bytesio", lambda: self._telegraph_files_file0(jpeg_data)),
+                ]
+            )
+
+        for upload_url in upload_urls:
+            for name, files_factory in attempts:
+                try:
+                    response = requests.post(
+                        upload_url,
+                        files=files_factory(),
+                        **req_kwargs,
+                    )
+                    return self._telegraph_parse_upload_response(response)
+                except Exception as e:
+                    errors.append(f"{upload_url}:{name}:{e}")
+
+        raise ValueError(f"telegraph_upload_failed: {' | '.join(errors[-4:])}")
+
+    @staticmethod
+    def _telegraph_files_bytesio(jpeg_data: bytes):
+        bio = io.BytesIO(jpeg_data)
+        bio.name = "file.jpg"
+        return {"file": ("file.jpg", bio, "image/jpeg")}
+
+    @staticmethod
+    def _telegraph_files_file0(jpeg_data: bytes):
+        bio = io.BytesIO(jpeg_data)
+        bio.name = "file0.jpg"
+        return [("file0", ("file0.jpg", bio, "image/jpeg"))]
+
+    def _telegraph_files_tempfile(self, jpeg_data: bytes):
+        fd, path = tempfile.mkstemp(suffix=".jpg")
+        try:
+            os.write(fd, jpeg_data)
+            os.close(fd)
+            with open(path, "rb") as handle:
+                return {"file": ("file.jpg", handle.read(), "image/jpeg")}
+        finally:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+
+    def _telegraph_upload_image_sync(self, image_data: bytes) -> str:
+        jpeg_data = self._prepare_telegraph_image(image_data)
+        return self._telegraph_upload_jpeg_sync(jpeg_data)
 
     def _search_pixiv_sync(
         self,
@@ -893,11 +1184,20 @@ class Rule34Searcher(loader.Module):
         limit: int,
         video_only: bool = False,
         max_pages: int = 2,
+        r18_only: bool = False,
+        manga_only: bool = False,
     ) -> List[Dict]:
         api = self._ensure_pixiv_api_sync()
         word = tags.strip() if tags else ("うごイラ" if video_only else "1girl")
 
-        tag_key = f"pixiv_{word}" if word else "pixiv_random"
+        prefix = "pixiv"
+        if manga_only and r18_only:
+            prefix = "pixiv_manga_r18"
+        elif manga_only:
+            prefix = "pixiv_manga"
+        elif r18_only:
+            prefix = "pixiv_r18"
+        tag_key = f"{prefix}_{word}" if word else f"{prefix}_random"
         recent_ids = self._recent_posts[tag_key]
         posts: List[Dict] = []
         next_qs = {
@@ -906,8 +1206,9 @@ class Rule34Searcher(loader.Module):
             "sort": "date_desc",
         }
         pages = 0
+        api_max_pages = 4 if manga_only else max_pages
 
-        while next_qs and len(posts) < limit and pages < max_pages:
+        while next_qs and len(posts) < limit and pages < api_max_pages:
             pages += 1
             result = api.search_illust(**next_qs)
             self._pixiv_validate_result(result)
@@ -924,6 +1225,18 @@ class Rule34Searcher(loader.Module):
                     continue
 
                 illust_type = getattr(illust, "type", "") or ""
+                x_restrict = int(getattr(illust, "x_restrict", 0) or 0)
+
+                if r18_only and x_restrict < 1:
+                    continue
+
+                if manga_only:
+                    if illust_type != "manga":
+                        continue
+                    page_count = int(getattr(illust, "page_count", 1) or 1)
+                    if page_count < 2:
+                        continue
+
                 if video_only and illust_type != "ugoira":
                     continue
 
@@ -943,9 +1256,11 @@ class Rule34Searcher(loader.Module):
                 posts.append({
                     "file_url": file_url,
                     "tags": tags_list,
-                    "rating": str(getattr(illust, "x_restrict", "") or ""),
+                    "rating": str(x_restrict),
                     "id": post_id,
                     "media_type": illust_type,
+                    "title": getattr(illust, "title", "") or "",
+                    "page_count": int(getattr(illust, "page_count", 1) or 1),
                 })
 
             if len(posts) >= limit:
@@ -963,6 +1278,8 @@ class Rule34Searcher(loader.Module):
         limit: Optional[int] = None,
         video_only: bool = False,
         send_count: int = 1,
+        r18_only: bool = False,
+        manga_only: bool = False,
     ) -> List[Dict]:
         if not self._get_pixiv_refresh_token():
             print("[Rule34Searcher] Pixiv: refresh_token not configured")
@@ -978,6 +1295,8 @@ class Rule34Searcher(loader.Module):
                         tags,
                         min(fetch_limit, 30),
                         video_only,
+                        r18_only=r18_only,
+                        manga_only=manga_only,
                     )
                 except Exception as e:
                     last_error = e
@@ -999,6 +1318,233 @@ class Rule34Searcher(loader.Module):
             import traceback
             traceback.print_exc()
             return []
+
+    def _download_pixiv_image_sync(self, url: str) -> bytes:
+        headers = get_request_headers(self.config["proxy_rotate_ua"])
+        headers["Referer"] = PIXIV_REFERER
+        response = requests.get(url, headers=headers, timeout=45)
+        response.raise_for_status()
+        data = response.content
+        if len(data) < 128:
+            raise ValueError("pixiv_image_too_small")
+        sniff = data[:256].lower()
+        if sniff.startswith(b"<!doctype") or sniff.startswith(b"<html"):
+            raise ValueError("pixiv_download_blocked")
+        return data
+
+    def _telegraph_create_page_sync(
+        self,
+        title: str,
+        author_name: str,
+        content_nodes: List[Dict],
+    ) -> str:
+        response = requests.post(
+            f"{TELEGRAPH_API}/createPage",
+            data={
+                "title": title[:256],
+                "author_name": author_name[:128],
+                "content": json.dumps(content_nodes, ensure_ascii=False),
+                "return_content": "true",
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("ok"):
+            raise ValueError(payload.get("error", "telegraph_create_failed"))
+        return f"https://telegra.ph/{payload['result']['path']}"
+
+    @staticmethod
+    def _pixiv_illust_author_name(illust) -> str:
+        user = getattr(illust, "user", None)
+        if user:
+            name = getattr(user, "name", None) or getattr(user, "account", None)
+            if name:
+                return str(name).strip()[:128]
+        return "Pixiv"
+
+    def _create_pixiv_manga_telegraph_sync(
+        self,
+        tags: str,
+        max_pages: int,
+    ) -> Optional[Dict]:
+        candidates = self._search_pixiv_sync(
+            tags,
+            limit=30,
+            max_pages=4,
+            manga_only=True,
+            r18_only=True,
+        )
+        if not candidates:
+            return None
+
+        random.shuffle(candidates)
+        api = self._ensure_pixiv_api_sync()
+        tag_key = f"pixiv_manga_r18_{tags.strip()}" if tags.strip() else "pixiv_manga_r18_random"
+        recent_ids = self._recent_posts[tag_key]
+
+        for candidate in candidates:
+            post_id = candidate.get("id", "")
+            if post_id and post_id in recent_ids:
+                continue
+
+            detail = api.illust_detail(post_id)
+            self._pixiv_validate_result(detail)
+            illust = getattr(detail, "illust", None)
+            if not illust:
+                continue
+
+            if int(getattr(illust, "x_restrict", 0) or 0) < 1:
+                continue
+
+            page_urls = self._pixiv_all_page_urls(illust, for_telegraph=True)
+            if len(page_urls) < 2:
+                continue
+
+            page_urls = page_urls[:max_pages]
+            title = (getattr(illust, "title", None) or tags or "Pixiv Manga").strip()
+            pixiv_author = self._pixiv_illust_author_name(illust)
+
+            pages_jpeg: List[bytes] = []
+            try:
+                for page_url in page_urls:
+                    raw = self._download_pixiv_image_sync(page_url)
+                    pages_jpeg.append(self._prepare_telegraph_image(raw))
+            except Exception as e:
+                print(f"[Rule34Searcher] Manga download failed for {post_id}: {e}")
+                continue
+
+            if len(pages_jpeg) < 2:
+                continue
+
+            if self._pixiv_manga_skip_telegraph():
+                if post_id:
+                    recent_ids.append(post_id)
+                return {
+                    "mode": "album",
+                    "title": title,
+                    "pages": pages_jpeg,
+                    "id": post_id,
+                    "album_plain": bool(self.config.get("pixiv_manga_album_only")),
+                }
+
+            try:
+                content_nodes: List[Dict] = []
+                telegraph_src = self._telegraph_upload_jpeg_sync(pages_jpeg[0], quick=True)
+                content_nodes.append({"tag": "img", "attrs": {"src": telegraph_src}})
+                for jpeg in pages_jpeg[1:]:
+                    telegraph_src = self._telegraph_upload_jpeg_sync(jpeg)
+                    content_nodes.append({"tag": "img", "attrs": {"src": telegraph_src}})
+                    time.sleep(0.45)
+
+                telegraph_url = self._telegraph_create_page_sync(
+                    title=title,
+                    author_name=pixiv_author,
+                    content_nodes=content_nodes,
+                )
+
+                if post_id:
+                    recent_ids.append(post_id)
+
+                return {
+                    "mode": "telegraph",
+                    "url": telegraph_url,
+                    "title": title,
+                    "pages": len(pages_jpeg),
+                    "id": post_id,
+                }
+            except Exception:
+                self._mark_telegraph_blocked()
+                if post_id:
+                    recent_ids.append(post_id)
+                return {
+                    "mode": "album",
+                    "title": title,
+                    "pages": pages_jpeg,
+                    "id": post_id,
+                    "album_plain": False,
+                }
+
+        return None
+
+    async def _schedule_message_delete(self, msg, delay: int):
+        if delay <= 0:
+            return
+        await asyncio.sleep(delay)
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+    async def _send_pixiv_manga_telegraph(self, message: Message, tags: str):
+        max_pages = self.config["pixiv_manga_max_pages"]
+
+        try:
+            result = await utils.run_sync(
+                self._create_pixiv_manga_telegraph_sync,
+                tags,
+                max_pages,
+            )
+        except Exception as e:
+            print(f"[Rule34Searcher] Pixiv manga telegraph error: {e}")
+            import traceback
+            traceback.print_exc()
+            err = str(e)
+            if "pillow" in err.lower() or "webp" in err.lower():
+                await utils.answer(message, self.strings("pixiv_manga_need_pillow"))
+            else:
+                await utils.answer(message, self.strings("pixiv_error").format(err))
+            return
+
+        if not result:
+            await utils.answer(message, self.strings("not_found"))
+            return
+
+        if result.get("mode") == "album":
+            album_key = (
+                "pixiv_manga_album_plain"
+                if result.get("album_plain")
+                else "pixiv_manga_album"
+            )
+            caption = self.strings(album_key).format(
+                result["title"],
+                len(result["pages"]),
+            )
+            files = []
+            for index, page_data in enumerate(result["pages"], start=1):
+                bio = io.BytesIO(page_data)
+                bio.name = f"page_{index}.jpg"
+                files.append(bio)
+            sent = await message.client.send_file(
+                message.peer_id,
+                files,
+                caption=caption,
+                parse_mode="html",
+                reply_to=getattr(message, "reply_to_msg_id", None),
+            )
+        else:
+            text = self.strings("pixiv_manga_ready").format(
+                result["title"],
+                result["url"],
+                result["pages"],
+            )
+            sent = await message.client.send_message(
+                message.peer_id,
+                text,
+                parse_mode="html",
+                link_preview=True,
+                reply_to=getattr(message, "reply_to_msg_id", None),
+            )
+
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        if self.config["telegraph_auto_delete"] and self.config["telegraph_delete_delay"] > 0:
+            asyncio.create_task(
+                self._schedule_message_delete(sent, self.config["telegraph_delete_delay"])
+            )
 
     async def _search_posts(
         self,
@@ -1334,6 +1880,41 @@ class Rule34Searcher(loader.Module):
         posts = await self._search_pixiv(tags, send_count=count)
         await self._send_posts(message, posts, tags, count)
 
+    async def _search_and_send_pixiv_nsfw_chat(self, message: Message, args: str):
+        """Поиск по триггеру «pixivnsfw [теги] [кол-во]»."""
+        user_id = message.sender_id
+        chat_id = message.peer_id
+
+        if await self._check_spam(user_id, chat_id):
+            return
+
+        if not self._get_pixiv_refresh_token():
+            return
+
+        tags, count = self._parse_tags_and_count(args)
+        if not tags:
+            return
+
+        posts = await self._search_pixiv(tags, send_count=count, r18_only=True)
+        await self._send_posts(message, posts, tags, count)
+
+    async def _send_pixiv_manga_chat(self, message: Message, args: str):
+        """Поиск по триггеру «pixivmanga [теги]»."""
+        user_id = message.sender_id
+        chat_id = message.peer_id
+
+        if await self._check_spam(user_id, chat_id):
+            return
+
+        if not self._get_pixiv_refresh_token():
+            return
+
+        tags = args.strip()
+        if not tags:
+            return
+
+        await self._send_pixiv_manga_telegraph(message, tags)
+
     @loader.watcher()
     async def watcher(self, message: Message):
         """Отслеживание триггер-слов"""
@@ -1378,6 +1959,22 @@ class Rule34Searcher(loader.Module):
             r34_match = re.match(r"^r34\s+(.+)$", message.text.strip(), re.IGNORECASE)
             if r34_match:
                 await self._search_and_send_r34_chat(message, r34_match.group(1))
+                return
+
+            # «pixivnsfw теги [кол-во]» — R-18 Pixiv
+            pixiv_nsfw_match = re.match(
+                r"^pixivnsfw\s+(.+)$", message.text.strip(), re.IGNORECASE
+            )
+            if pixiv_nsfw_match:
+                await self._search_and_send_pixiv_nsfw_chat(message, pixiv_nsfw_match.group(1))
+                return
+
+            # «pixivmanga теги» — манга в Telegraph
+            pixiv_manga_match = re.match(
+                r"^pixivmanga\s+(.+)$", message.text.strip(), re.IGNORECASE
+            )
+            if pixiv_manga_match:
+                await self._send_pixiv_manga_chat(message, pixiv_manga_match.group(1))
                 return
 
             # «pixiv теги [кол-во]» — как команда .pixiv
@@ -1678,4 +2275,56 @@ class Rule34Searcher(loader.Module):
             return
 
         await self._send_posts(message, posts, tags, count)
+
+    @loader.command(
+        ru_doc="Pixiv R-18 поиск",
+        en_doc="Pixiv R-18 search",
+    )
+    async def pixivnsfwcmd(self, message: Message):
+        """[теги] [кол-во] - Pixiv R-18"""
+        if not self._is_chat_allowed(message.peer_id):
+            chat_id_num = self._get_chat_id(message.peer_id)
+            await utils.answer(message, self.strings("chat_not_whitelisted").format(chat_id_num))
+            return
+
+        if not self._get_pixiv_refresh_token():
+            await utils.answer(message, self.strings("pixiv_no_token"))
+            return
+
+        args = utils.get_args_raw(message)
+        if not args:
+            await utils.answer(message, self.strings("usage_pixiv_nsfw"))
+            return
+
+        tags, count = self._parse_tags_and_count(args)
+
+        try:
+            posts = await self._search_pixiv(tags, send_count=count, r18_only=True)
+        except Exception as e:
+            await utils.answer(message, self.strings("pixiv_error").format(str(e)))
+            return
+
+        await self._send_posts(message, posts, tags, count)
+
+    @loader.command(
+        ru_doc="Pixiv R-18 манга в Telegraph",
+        en_doc="Pixiv R-18 manga to Telegraph",
+    )
+    async def pixivmangacmd(self, message: Message):
+        """[теги] - R-18 манга Pixiv в Telegraph"""
+        if not self._is_chat_allowed(message.peer_id):
+            chat_id_num = self._get_chat_id(message.peer_id)
+            await utils.answer(message, self.strings("chat_not_whitelisted").format(chat_id_num))
+            return
+
+        if not self._get_pixiv_refresh_token():
+            await utils.answer(message, self.strings("pixiv_no_token"))
+            return
+
+        args = utils.get_args_raw(message)
+        if not args:
+            await utils.answer(message, self.strings("usage_pixiv_manga"))
+            return
+
+        await self._send_pixiv_manga_telegraph(message, args.strip())
 
