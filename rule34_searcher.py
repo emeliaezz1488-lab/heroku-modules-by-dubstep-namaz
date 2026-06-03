@@ -1,7 +1,5 @@
 # meta developer: @dubstep_namaz1337
-# meta banner: https://i.imgur.com/gallery/icon-of-rule34-FAzGMDE
-
-"""
+# meta banner: https://raw.githubusercontent.com/emeliaezz1488-lab/heroku-modules-by-dubstep-namaz/main/Banners/logo.png
 Модуль для поиска изображений и видео на Rule34, Danbooru и Pixiv (тут ище мангу можно искать бееее).
 
 Команды:
