@@ -37,6 +37,22 @@ import xml.etree.ElementTree as ET
 from typing import List, Dict, Optional, Tuple
 from collections import defaultdict, deque
 from herokutl.types import Message
+try:
+    from herokutl.tl.functions.messages import SendMediaRequest
+    from herokutl.tl.types import (
+        DocumentAttributeFilename,
+        DocumentAttributeVideo,
+        InputMediaUploadedDocument,
+        InputMediaUploadedPhoto,
+        InputReplyToMessage,
+    )
+except Exception:
+    SendMediaRequest = None
+    DocumentAttributeFilename = None
+    DocumentAttributeVideo = None
+    InputMediaUploadedDocument = None
+    InputMediaUploadedPhoto = None
+    InputReplyToMessage = None
 from .. import loader, utils
 
 PIXIV_REFERER = "https://www.pixiv.net/"
@@ -406,6 +422,12 @@ class Rule34Searcher(loader.Module):
                 "download_before_send",
                 False,
                 "Скачивать файлы перед отправкой (медленнее, но надежнее)",
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "spoiler_media",
+                True,
+                "Отправлять медиа в скрытом режиме (спойлер — размытое медиа)",
                 validator=loader.validators.Boolean(),
             ),
             loader.ConfigValue(
@@ -1189,6 +1211,7 @@ class Rule34Searcher(loader.Module):
             caption=caption,
             parse_mode="html",
             reply_to=getattr(message, "reply_to_msg_id", None),
+            spoiler=self.config["spoiler_media"],
         )
 
         try:
@@ -1377,6 +1400,100 @@ class Rule34Searcher(loader.Module):
                     except Exception:
                         pass
 
+    def _probe_video_meta(self, media_bytes: bytes):
+        """Вернуть (width, height, duration) видео через ffprobe или (0, 0, 0)."""
+        import shutil
+        import subprocess
+        if not shutil.which("ffprobe"):
+            return (0, 0, 0)
+        tmp_in = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f_in:
+                f_in.write(media_bytes)
+                tmp_in = f_in.name
+            probe = subprocess.run(
+                [
+                    "ffprobe", "-v", "error",
+                    "-select_streams", "v:0",
+                    "-show_entries", "stream=width,height:format=duration",
+                    "-of", "csv=p=0",
+                    tmp_in,
+                ],
+                capture_output=True, timeout=60,
+            )
+            out = probe.stdout.decode(errors="ignore").strip()
+            nums = [p for p in out.replace("\n", ",").split(",") if p.strip()]
+            w = int(float(nums[0])) if len(nums) >= 1 and nums[0].strip() else 0
+            h = int(float(nums[1])) if len(nums) >= 2 and nums[1].strip() else 0
+            dur = int(float(nums[2])) if len(nums) >= 3 and nums[2].strip() else 0
+            return (w, h, dur)
+        except Exception as e:
+            print(f"[Rule34Searcher] _probe_video_meta failed: {e}")
+            return (0, 0, 0)
+        finally:
+            if tmp_in and os.path.exists(tmp_in):
+                try:
+                    os.remove(tmp_in)
+                except Exception:
+                    pass
+
+    async def _send_media_spoiler(self, message, media_bytes, filename, caption, is_video):
+        """Отправить медиа со СПОЙЛЕРОМ через raw API.
+        Спойлер в Telegram работает только для ЗАГРУЖЕННЫХ медиа (не по URL),
+        а обычный spoiler= в send_file ненадёжен, поэтому используем
+        SendMediaRequest + InputMediaUploaded*(spoiler=True). Возвращает None при неудаче."""
+        if not (SendMediaRequest and InputMediaUploadedPhoto and InputMediaUploadedDocument):
+            return None
+        try:
+            bio = io.BytesIO(media_bytes)
+            bio.name = filename
+            uploaded = await message.client.upload_file(bio, file_name=filename)
+            try:
+                text, entities = message.client.parse_mode.parse(caption or "")
+            except Exception:
+                text, entities = caption or "", []
+            reply_to = getattr(message, "reply_to_msg_id", None)
+            request_reply_to = reply_to
+            if reply_to is not None and InputReplyToMessage and isinstance(reply_to, int):
+                request_reply_to = InputReplyToMessage(reply_to_msg_id=reply_to)
+            if is_video:
+                attributes = []
+                if DocumentAttributeVideo:
+                    w, h, dur = await utils.run_sync(self._probe_video_meta, media_bytes)
+                    attributes.append(
+                        DocumentAttributeVideo(
+                            duration=dur, w=w, h=h, supports_streaming=True
+                        )
+                    )
+                if DocumentAttributeFilename:
+                    attributes.append(DocumentAttributeFilename(filename))
+                media = InputMediaUploadedDocument(
+                    file=uploaded,
+                    mime_type="video/mp4",
+                    attributes=attributes,
+                    spoiler=True,
+                )
+            else:
+                media = InputMediaUploadedPhoto(file=uploaded, spoiler=True)
+            request = SendMediaRequest(
+                peer=await message.client.get_input_entity(message.peer_id),
+                media=media,
+                message=text,
+                random_id=random.getrandbits(63),
+                reply_to=request_reply_to,
+                entities=entities or [],
+            )
+            result = await message.client(request)
+            try:
+                return message.client._get_response_message(
+                    request, result, await message.client.get_input_entity(message.peer_id)
+                )
+            except Exception:
+                return result
+        except Exception as e:
+            print(f"[Rule34Searcher] _send_media_spoiler failed: {e}")
+            return None
+
     async def _send_posts(self, message: Message, posts: List[Dict], requested_tags: str, count: int):
         """Отправка постов (изображения и видео)"""
         if not posts:
@@ -1436,7 +1553,13 @@ class Rule34Searcher(loader.Module):
                 # звука нет (добавляем тихую дорожку без перекодирования). Видео
                 # со звуком шлём по URL.
                 is_video_ext = file_ext in ['mp4', 'webm', 'gif', 'mov', 'avi', 'mkv']
+                spoiler = self.config["spoiler_media"]
                 sent_msg = None
+
+                # Готовим видео так, чтобы Telegram не показывал его как гифку.
+                # .gif всегда перекодируем; для остальных проверяем звук по сети
+                # и трогаем файл только если звука нет.
+                video_bytes = None  # mp4-байты, если видео пришлось готовить
                 if is_video_ext:
                     if file_ext == "gif":
                         needs_fix = True
@@ -1450,19 +1573,43 @@ class Rule34Searcher(loader.Module):
                                 self._make_streamable_mp4, media_bytes, file_ext
                             )
                             if mp4_bytes:
-                                bio = io.BytesIO(mp4_bytes)
-                                bio.name = f"{post_id or 'video'}.mp4"
-                                sent_msg = await message.client.send_file(
-                                    message.peer_id,
-                                    bio,
-                                    caption=caption,
-                                    parse_mode="html",
-                                    reply_to=getattr(message, "reply_to_msg_id", None),
-                                    supports_streaming=True,
-                                    force_document=False,
-                                )
+                                video_bytes = mp4_bytes
+
+                if spoiler:
+                    # СПОЙЛЕР: медиа нужно ЗАГРУЗИТЬ (по URL спойлер не работает).
+                    if is_video_ext:
+                        vb = video_bytes
+                        if vb is None:
+                            vb = await self._download_file(file_url)
+                        if vb is not None:
+                            sent_msg = await self._send_media_spoiler(
+                                message, vb, f"{post_id or 'video'}.mp4", caption, True
+                            )
+                    else:
+                        img_bytes = await self._download_file(file_url)
+                        if img_bytes is not None:
+                            safe_ext = file_ext if file_ext.isalnum() else "jpg"
+                            sent_msg = await self._send_media_spoiler(
+                                message, img_bytes,
+                                f"{post_id or 'image'}.{safe_ext}", caption, False
+                            )
+
+                if sent_msg is None and video_bytes is not None:
+                    # Видео сконвертировано, спойлер выкл. или не удался — шлём байтами.
+                    bio = io.BytesIO(video_bytes)
+                    bio.name = f"{post_id or 'video'}.mp4"
+                    sent_msg = await message.client.send_file(
+                        message.peer_id,
+                        bio,
+                        caption=caption,
+                        parse_mode="html",
+                        reply_to=getattr(message, "reply_to_msg_id", None),
+                        supports_streaming=True,
+                        force_document=False,
+                    )
+
                 if sent_msg is None:
-                    # Картинки, видео со звуком, либо фолбэк при неудаче конвертации.
+                    # Картинки, видео со звуком, либо фолбэк при неудаче.
                     sent_msg = await message.client.send_file(
                         message.peer_id,
                         file_url,
