@@ -1,5 +1,6 @@
 # meta developer: @dubstep_namaz1337
 # meta banner: https://raw.githubusercontent.com/emeliaezz1488-lab/heroku-modules-by-dubstep-namaz/main/Banners/logo.png
+"""
 Модуль для поиска изображений и видео на Rule34, Danbooru и Pixiv (тут ище мангу можно искать бееее).
 
 Команды:
@@ -1270,6 +1271,112 @@ class Rule34Searcher(loader.Module):
             print(f"[Rule34Searcher] Error downloading file: {e}")
             return None
 
+    def _video_has_audio(self, url: str) -> bool:
+        # Быстрая проверка по сети: есть ли у видео аудиодорожка.
+        # Делается через ffprobe прямо по URL (без полной загрузки файла).
+        # При любой неудаче возвращаем True, чтобы не тормозить отправку:
+        # такое видео уйдёт по URL как раньше.
+        import shutil
+        import subprocess
+        if not shutil.which("ffprobe"):
+            return True
+        try:
+            ua = get_random_user_agent()
+            probe = subprocess.run(
+                [
+                    "ffprobe", "-user_agent", ua,
+                    "-v", "error",
+                    "-select_streams", "a",
+                    "-show_entries", "stream=index",
+                    "-of", "csv=p=0",
+                    url,
+                ],
+                capture_output=True, timeout=30,
+            )
+            if probe.returncode != 0:
+                return True
+            return bool(probe.stdout.strip())
+        except Exception as e:
+            print(f"[Rule34Searcher] ffprobe url failed: {e}")
+            return True
+
+    def _make_streamable_mp4(self, media_bytes: bytes, ext: str) -> Optional[bytes]:
+        # Возвращает mp4-байты, которые Telegram покажет как ВИДЕО, а не гифку.
+        # Telegram считает анимацией .gif и видео без аудио, поэтому добавляем
+        # тихую аудиодорожку. Чтобы было быстро, видеопоток по возможности
+        # копируем без перекодирования (-c:v copy); полный libx264 — только если
+        # копирование невозможно (например, .gif или .webm). Нужен ffmpeg.
+        import shutil
+        import subprocess
+        ext = (ext or "").lower()
+        if not shutil.which("ffmpeg"):
+            print("[Rule34Searcher] ffmpeg не найден — отправляю медиа как есть")
+            return media_bytes if ext == "mp4" else None
+        tmp_in = None
+        tmp_out = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix="." + ext, delete=False) as f_in:
+                f_in.write(media_bytes)
+                tmp_in = f_in.name
+            has_audio = False
+            if shutil.which("ffprobe"):
+                probe = subprocess.run(
+                    [
+                        "ffprobe", "-v", "error",
+                        "-select_streams", "a",
+                        "-show_entries", "stream=index",
+                        "-of", "csv=p=0",
+                        tmp_in,
+                    ],
+                    capture_output=True, timeout=60,
+                )
+                has_audio = bool(probe.stdout.strip())
+            if ext == "mp4" and has_audio:
+                return media_bytes
+            tmp_out = tmp_in + ".out.mp4"
+
+            def build(copy_video):
+                cmd = ["ffmpeg", "-y", "-i", tmp_in]
+                if not has_audio:
+                    cmd += [
+                        "-f", "lavfi",
+                        "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                        "-shortest",
+                    ]
+                cmd += ["-movflags", "+faststart"]
+                if copy_video:
+                    cmd += ["-c:v", "copy"]
+                else:
+                    cmd += [
+                        "-pix_fmt", "yuv420p",
+                        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                        "-c:v", "libx264",
+                        "-preset", "veryfast",
+                    ]
+                cmd += ["-c:a", "aac", tmp_out]
+                return cmd
+
+            result = None
+            if ext in ("mp4", "mov", "mkv"):
+                result = subprocess.run(build(True), capture_output=True, timeout=300)
+            if result is None or result.returncode != 0:
+                result = subprocess.run(build(False), capture_output=True, timeout=300)
+            if result.returncode != 0:
+                print(f"[Rule34Searcher] ffmpeg error: {result.stderr.decode(errors='ignore')[:300]}")
+                return media_bytes if ext == "mp4" else None
+            with open(tmp_out, "rb") as f:
+                return f.read()
+        except Exception as e:
+            print(f"[Rule34Searcher] _make_streamable_mp4 failed: {e}")
+            return media_bytes if ext == "mp4" else None
+        finally:
+            for p in (tmp_in, tmp_out):
+                if p and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+
     async def _send_posts(self, message: Message, posts: List[Dict], requested_tags: str, count: int):
         """Отправка постов (изображения и видео)"""
         if not posts:
@@ -1322,16 +1429,49 @@ class Rule34Searcher(loader.Module):
                 
                 print(f"[Rule34Searcher] Attempt {attempts}: Sending {file_ext} file (video={is_video}): {file_url[:80]}...")
                 
-                # Отправляем файл по URL (быстрее и надежнее)
-                sent_msg = await message.client.send_file(
-                    message.peer_id,
-                    file_url,
-                    caption=caption,
-                    parse_mode="html",
-                    reply_to=getattr(message, "reply_to_msg_id", None),
-                    supports_streaming=is_video,
-                )
-                
+                # Видео отправляем так, чтобы Telegram не показывал его как гифку.
+                # Telegram считает анимацией .gif и любое видео без аудиодорожки.
+                # Поэтому: .gif всегда перекодируем; для остальных видео сначала
+                # быстро проверяем по сети наличие звука и трогаем файл только если
+                # звука нет (добавляем тихую дорожку без перекодирования). Видео
+                # со звуком шлём по URL.
+                is_video_ext = file_ext in ['mp4', 'webm', 'gif', 'mov', 'avi', 'mkv']
+                sent_msg = None
+                if is_video_ext:
+                    if file_ext == "gif":
+                        needs_fix = True
+                    else:
+                        has_audio = await utils.run_sync(self._video_has_audio, file_url)
+                        needs_fix = not has_audio
+                    if needs_fix:
+                        media_bytes = await self._download_file(file_url)
+                        if media_bytes:
+                            mp4_bytes = await utils.run_sync(
+                                self._make_streamable_mp4, media_bytes, file_ext
+                            )
+                            if mp4_bytes:
+                                bio = io.BytesIO(mp4_bytes)
+                                bio.name = f"{post_id or 'video'}.mp4"
+                                sent_msg = await message.client.send_file(
+                                    message.peer_id,
+                                    bio,
+                                    caption=caption,
+                                    parse_mode="html",
+                                    reply_to=getattr(message, "reply_to_msg_id", None),
+                                    supports_streaming=True,
+                                    force_document=False,
+                                )
+                if sent_msg is None:
+                    # Картинки, видео со звуком, либо фолбэк при неудаче конвертации.
+                    sent_msg = await message.client.send_file(
+                        message.peer_id,
+                        file_url,
+                        caption=caption,
+                        parse_mode="html",
+                        reply_to=getattr(message, "reply_to_msg_id", None),
+                        supports_streaming=is_video_ext,
+                    )
+
                 sent_messages.append(sent_msg)
                 sent_count += 1
                 
