@@ -473,7 +473,7 @@ class Rule34Searcher(loader.Module):
         self.client = client
         self._db = db
         # Загружаем вайтлист из БД
-        self._chat_whitelist = set(self._db.get(__name__, "chat_whitelist", []))
+        self._chat_whitelist = set(self._db.get("Rule34Searcher", "chat_whitelist", []))
         if self._get_pixiv_refresh_token():
             asyncio.create_task(self._warm_pixiv_api())
             self._pixiv_refresh_task = asyncio.create_task(self._pixiv_token_refresh_loop())
@@ -524,7 +524,7 @@ class Rule34Searcher(loader.Module):
 
     def _save_whitelist(self):
         """Сохранить вайтлист в БД"""
-        self._db.set(__name__, "chat_whitelist", list(self._chat_whitelist))
+        self._db.set("Rule34Searcher", "chat_whitelist", list(self._chat_whitelist))
 
     def _save_proxies(self):
         """Сохранить рабочие прокси в файл"""
@@ -823,14 +823,14 @@ class Rule34Searcher(loader.Module):
         config_token = (self.config.get("pixiv_refresh_token") or "").strip()
         db_token = ""
         if getattr(self, "_db", None):
-            db_token = (self._db.get(__name__, "pixiv_refresh_token_active", "") or "").strip()
+            db_token = (self._db.get("Rule34Searcher", "pixiv_refresh_token_active", "") or "").strip()
         return db_token or config_token
 
     def _save_pixiv_refresh_token(self, refresh_token: str):
         token = (refresh_token or "").strip()
         if not token or not getattr(self, "_db", None):
             return
-        self._db.set(__name__, "pixiv_refresh_token_active", token)
+        self._db.set("Rule34Searcher", "pixiv_refresh_token_active", token)
 
     def _pixiv_fetch_limit(self, send_count: int) -> int:
         """Pixiv отдаёт ~30 работ за запрос — не качаем лишние страницы."""
