@@ -1,5 +1,9 @@
 # meta developer: @dubstep_namaz1337
 # meta banner: https://raw.githubusercontent.com/emeliaezz1488-lab/heroku-modules-by-dubstep-namaz/main/Banners/logo.png
+<<<<<<< HEAD
+=======
+
+>>>>>>> e6ec61d1d990fb57d5116dffd348d737b6e2e3ab
 """
 Модуль для поиска изображений и видео на Rule34, Danbooru и Pixiv (тут ище мангу можно искать бееее).
 
