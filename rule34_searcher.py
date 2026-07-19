@@ -1,5 +1,8 @@
+__version__ = (2, 0, 0)
+# diff: Трекинг фоновых задач + отмена в on_unload, авто-нотификатор обновлений; ранее: вырезан proxy, print->logging, дедуп импортов, фоновое автоудаление.
 # meta developer: @dubstep_namaz1337
 # meta banner: https://raw.githubusercontent.com/emeliaezz1488-lab/heroku-modules-by-dubstep-namaz/main/Banners/logo.png
+# requires: pixivpy3
 """
 Модуль для поиска изображений и видео на Rule34, Danbooru и Pixiv (тут ище мангу можно искать бееее).
 
@@ -29,10 +32,10 @@ import tempfile
 import requests
 import asyncio
 import json
-import os
 import time
-import threading
-import concurrent.futures
+import logging
+import shutil
+import subprocess
 import xml.etree.ElementTree as ET
 from typing import List, Dict, Optional, Tuple
 from collections import defaultdict, deque
@@ -57,6 +60,8 @@ from .. import loader, utils
 
 PIXIV_REFERER = "https://www.pixiv.net/"
 
+logger = logging.getLogger(__name__)
+
 # User-Agent список для ротации
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -68,105 +73,6 @@ USER_AGENTS = [
 def get_random_user_agent() -> str:
     """Получить случайный User-Agent"""
     return random.choice(USER_AGENTS)
-
-
-def normalize_proxy_url(raw: str) -> Optional[str]:
-    """Нормализация URL прокси"""
-    try:
-        if raw is None:
-            return None
-        s = str(raw).strip()
-        if not s:
-            return None
-
-        if s.startswith("http://") or s.startswith("https://") or s.startswith("socks4://") or s.startswith("socks5://"):
-            return s
-
-        parts = s.split(":")
-        if len(parts) == 2:
-            host, port = parts
-            if host and port:
-                return f"http://{host}:{port}"
-            return None
-
-        if len(parts) == 4:
-            host, port, user, pwd = parts
-            if host and port and user and pwd:
-                return f"http://{user}:{pwd}@{host}:{port}"
-            return None
-
-        return None
-    except Exception:
-        return None
-
-
-def build_requests_proxies(proxy_url: Optional[str]) -> Optional[dict]:
-    """Построить словарь прокси для requests"""
-    p = normalize_proxy_url(proxy_url)
-    if not p:
-        return None
-    return {"http": p, "https": p}
-
-
-def check_single_proxy(proxy: str) -> Tuple[str, bool, float]:
-    """Проверить один прокси"""
-    start_time = time.time()
-    
-    try:
-        proxy_dict = build_requests_proxies(proxy)
-        if not proxy_dict:
-            return proxy, False, 0
-        
-        response = requests.get(
-            "https://yande.re",
-            proxies=proxy_dict,
-            timeout=3
-        )
-        
-        if response.status_code == 200:
-            response_time = time.time() - start_time
-            return proxy, True, response_time
-        else:
-            return proxy, False, 0
-            
-    except Exception:
-        return proxy, False, 0
-
-
-def check_proxies_parallel(proxies: List[str], max_workers: int = 50, max_working: int = 20) -> List[Dict]:
-    """Проверить прокси параллельно"""
-    working_proxies = []
-    working_proxies_lock = threading.Lock()
-    stop_search = threading.Event()
-    
-    def check_proxy_wrapper(proxy):
-        if stop_search.is_set():
-            return proxy, False, 0
-            
-        proxy, is_working, response_time = check_single_proxy(proxy)
-        
-        if is_working:
-            with working_proxies_lock:
-                working_proxies.append({
-                    "proxy": proxy,
-                    "response_time": response_time
-                })
-                
-                if len(working_proxies) >= max_working:
-                    stop_search.set()
-        
-        return proxy, is_working, response_time
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_proxy = {executor.submit(check_proxy_wrapper, proxy): proxy for proxy in proxies}
-        
-        for future in concurrent.futures.as_completed(future_to_proxy):
-            if stop_search.is_set():
-                for f in future_to_proxy:
-                    f.cancel()
-                break
-    
-    return working_proxies
 
 
 def get_request_headers(rotate_ua: bool = True) -> dict:
@@ -237,51 +143,6 @@ class Rule34Searcher(loader.Module):
     
     strings = {
         "name": "Rule34Searcher",
-        "not_found": "Ничего не найдено!",
-        "searching": "Ищем...",
-        "error": "Ошибка: {}",
-        "usage_r34": "Использование: .r34 [теги] [кол-во]\nПример: .r34 anime 2",
-        "usage_danbooru": "Использование: .danbooru [теги] [кол-во]\nПример: .danbooru anime 2",
-        "usage_pixiv": "Использование: .pixiv [теги] [кол-во]\nПример: .pixiv 1girl 2",
-        "usage_pixiv_nsfw": "Использование: .pixivnsfw [теги] [кол-во]\nПример: .pixivnsfw femboy 2",
-        "usage_pixiv_manga": "Использование: .pixivmanga [теги]\nПример: .pixivmanga futanari\n(только R-18 манга)",
-        "pixiv_no_token": "Pixiv: укажи refresh_token в настройках модуля (pixiv_refresh_token)",
-        "pixiv_error": "Ошибка Pixiv: {}",
-        "pixiv_manga_need_pillow": "Для манги нужен Pillow на сервере: pip install Pillow",
-        "pixiv_manga_album": "📖 <b>{}</b> ({} стр.)",
-        "proxy_update_started": "Обновление прокси началось...",
-        "proxy_update_success": "Список прокси обновлен! Найдено {} рабочих прокси",
-        "proxy_update_error": "Ошибка при обновлении прокси: {}",
-        "whitelist_help": "❌ <b>Укажите аргумент для команды!</b>\n\n<b>Использование:</b>\n• <code>.whitelist add [chat_id]</code> - добавить чат\n• <code>.whitelist remove [chat_id]</code> - удалить чат\n• <code>.whitelist list</code> - показать список",
-        "chat_not_whitelisted": "⚠️ <b>Чат не в вайтлисте!</b>\n\nДобавьте сначала этот чат в вайтлист:\n<code>.whitelist add {}</code>\n\nИли отключите вайтлист в конфиге модуля.",
-        "current_chat_id": "Текущий чат ID",
-        "whitelist_empty": "Вайтлист пуст",
-        "add_chats_with_command": "Добавьте чаты командой",
-        "chat_whitelist": "Вайтлист чатов",
-        "total_chats": "Всего чатов",
-        "whitelist": "Вайтлист",
-        "enabled": "Включен",
-        "disabled": "Выключен",
-        "specify_chat_id": "Укажите ID чата!",
-        "usage": "Использование",
-        "example": "Пример",
-        "invalid_chat_id_format": "Неверный формат ID чата!",
-        "id_must_be_number": "ID должен быть числом.",
-        "chat": "Чат",
-        "already_in_whitelist": "уже в вайтлисте!",
-        "total_in_whitelist": "Всего в вайтлисте",
-        "chat_added_to_whitelist": "Чат добавлен в вайтлист!",
-        "not_found_in_whitelist": "не найден в вайтлисте!",
-        "remaining_in_whitelist": "Осталось в вайтлисте",
-        "chat_removed_from_whitelist": "Чат удален из вайтлиста!",
-        "unknown_argument": "Неизвестный аргумент",
-        "available_arguments": "Доступные аргументы",
-        "add_chat": "добавить чат",
-        "remove_chat": "удалить чат",
-        "show_list": "показать список",
-    }
-    
-    strings_en = {
         "not_found": "Nothing found!",
         "searching": "Searching...",
         "error": "Error: {}",
@@ -294,9 +155,6 @@ class Rule34Searcher(loader.Module):
         "pixiv_error": "Pixiv error: {}",
         "pixiv_manga_need_pillow": "Pixiv manga requires Pillow: pip install Pillow",
         "pixiv_manga_album": "📖 <b>{}</b> ({} pages)",
-        "proxy_update_started": "Proxy update started...",
-        "proxy_update_success": "Proxy list updated! Found {} working proxies",
-        "proxy_update_error": "Proxy update error: {}",
         "whitelist_help": "❌ <b>Specify command argument!</b>\n\n<b>Usage:</b>\n• <code>.whitelist add [chat_id]</code> - add chat\n• <code>.whitelist remove [chat_id]</code> - remove chat\n• <code>.whitelist list</code> - show list",
         "chat_not_whitelisted": "⚠️ <b>Chat not in whitelist!</b>\n\nAdd this chat to whitelist first:\n<code>.whitelist add {}</code>\n\nOr disable whitelist in module config.",
         "current_chat_id": "Current chat ID",
@@ -324,6 +182,48 @@ class Rule34Searcher(loader.Module):
         "add_chat": "add chat",
         "remove_chat": "remove chat",
         "show_list": "show list",
+    }
+
+    strings_ru = {
+        "not_found": "Ничего не найдено!",
+        "searching": "Ищем...",
+        "error": "Ошибка: {}",
+        "usage_r34": "Использование: .r34 [теги] [кол-во]\nПример: .r34 anime 2",
+        "usage_danbooru": "Использование: .danbooru [теги] [кол-во]\nПример: .danbooru anime 2",
+        "usage_pixiv": "Использование: .pixiv [теги] [кол-во]\nПример: .pixiv 1girl 2",
+        "usage_pixiv_nsfw": "Использование: .pixivnsfw [теги] [кол-во]\nПример: .pixivnsfw femboy 2",
+        "usage_pixiv_manga": "Использование: .pixivmanga [теги]\nПример: .pixivmanga futanari\n(только R-18 манга)",
+        "pixiv_no_token": "Pixiv: укажи refresh_token в настройках модуля (pixiv_refresh_token)",
+        "pixiv_error": "Ошибка Pixiv: {}",
+        "pixiv_manga_need_pillow": "Для манги нужен Pillow на сервере: pip install Pillow",
+        "pixiv_manga_album": "📖 <b>{}</b> ({} стр.)",
+        "whitelist_help": "❌ <b>Укажите аргумент для команды!</b>\n\n<b>Использование:</b>\n• <code>.whitelist add [chat_id]</code> - добавить чат\n• <code>.whitelist remove [chat_id]</code> - удалить чат\n• <code>.whitelist list</code> - показать список",
+        "chat_not_whitelisted": "⚠️ <b>Чат не в вайтлисте!</b>\n\nДобавьте сначала этот чат в вайтлист:\n<code>.whitelist add {}</code>\n\nИли отключите вайтлист в конфиге модуля.",
+        "current_chat_id": "Текущий чат ID",
+        "whitelist_empty": "Вайтлист пуст",
+        "add_chats_with_command": "Добавьте чаты командой",
+        "chat_whitelist": "Вайтлист чатов",
+        "total_chats": "Всего чатов",
+        "whitelist": "Вайтлист",
+        "enabled": "Включен",
+        "disabled": "Выключен",
+        "specify_chat_id": "Укажите ID чата!",
+        "usage": "Использование",
+        "example": "Пример",
+        "invalid_chat_id_format": "Неверный формат ID чата!",
+        "id_must_be_number": "ID должен быть числом.",
+        "chat": "Чат",
+        "already_in_whitelist": "уже в вайтлисте!",
+        "total_in_whitelist": "Всего в вайтлисте",
+        "chat_added_to_whitelist": "Чат добавлен в вайтлист!",
+        "not_found_in_whitelist": "не найден в вайтлисте!",
+        "remaining_in_whitelist": "Осталось в вайтлисте",
+        "chat_removed_from_whitelist": "Чат удален из вайтлиста!",
+        "unknown_argument": "Неизвестный аргумент",
+        "available_arguments": "Доступные аргументы",
+        "add_chat": "добавить чат",
+        "remove_chat": "удалить чат",
+        "show_list": "показать список",
     }
 
     def __init__(self):
@@ -357,42 +257,6 @@ class Rule34Searcher(loader.Module):
                 1,
                 "Сколько постов отправлять (макс: 10)",
                 validator=loader.validators.Integer(minimum=1, maximum=10),
-            ),
-            loader.ConfigValue(
-                "use_proxy",
-                False,
-                "Использовать прокси",
-                validator=loader.validators.Boolean(),
-            ),
-            loader.ConfigValue(
-                "proxy_rotate",
-                True,
-                "Ротировать прокси",
-                validator=loader.validators.Boolean(),
-            ),
-            loader.ConfigValue(
-                "proxy_rotate_ua",
-                True,
-                "Ротировать User-Agent",
-                validator=loader.validators.Boolean(),
-            ),
-            loader.ConfigValue(
-                "proxy_source",
-                "builtin",
-                "Источник прокси (builtin/url/manual)",
-                validator=loader.validators.Choice(["builtin", "url", "manual"]),
-            ),
-            loader.ConfigValue(
-                "proxy_source_url",
-                "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.txt",
-                "URL списка прокси",
-                validator=loader.validators.String(),
-            ),
-            loader.ConfigValue(
-                "proxy_manual_list",
-                "",
-                "Ручной список прокси (ip:port, по одному на строку)",
-                validator=loader.validators.String(),
             ),
             loader.ConfigValue(
                 "triggers_enabled",
@@ -446,7 +310,7 @@ class Rule34Searcher(loader.Module):
                 "pixiv_refresh_token",
                 "",
                 "Pixiv refresh_token (из gppt / get_pixiv_token.py)",
-                validator=loader.validators.String(),
+                validator=loader.validators.Hidden(loader.validators.String()),
             ),
             loader.ConfigValue(
                 "pixiv_manga_max_pages",
@@ -460,9 +324,13 @@ class Rule34Searcher(loader.Module):
         self._pixiv_token_cached = ""
         self._pixiv_auth_at = 0.0
         self._pixiv_refresh_task = None
+        self._bg_tasks = set()
+        self._update_check_task = None
+        self._update_notice_lock = asyncio.Lock()
+        self.update_source_url = "https://raw.githubusercontent.com/emeliaezz1488-lab/heroku-modules-by-dubstep-namaz/refs/heads/main/rule34_searcher.py"
+        self.update_check_interval = 21600
+        self.update_notice_repeat_interval = 5 * 24 * 60 * 60
         self.PIXIV_ACCESS_TTL = 3000  # access_token ~1ч, обновляем заранее
-        self._working_proxies = []
-        self._proxy_file = "booru_proxies.json"
         
         # Вайтлист чатов (будет загружаться из БД)
         self._chat_whitelist = set()
@@ -497,12 +365,20 @@ class Rule34Searcher(loader.Module):
         # Загружаем вайтлист из БД
         self._chat_whitelist = set(self._db.get("Rule34Searcher", "chat_whitelist", []))
         if self._get_pixiv_refresh_token():
-            asyncio.create_task(self._warm_pixiv_api())
-            self._pixiv_refresh_task = asyncio.create_task(self._pixiv_token_refresh_loop())
+            self._spawn_task(self._warm_pixiv_api())
+            self._pixiv_refresh_task = self._spawn_task(self._pixiv_token_refresh_loop())
+        if self._update_check_task and not self._update_check_task.done():
+            self._update_check_task.cancel()
+        self._update_check_task = self._spawn_task(self._update_check_loop())
 
     async def on_unload(self):
         if self._pixiv_refresh_task and not self._pixiv_refresh_task.done():
             self._pixiv_refresh_task.cancel()
+        if self._update_check_task and not self._update_check_task.done():
+            self._update_check_task.cancel()
+        for task in tuple(self._bg_tasks):
+            task.cancel()
+        self._bg_tasks.clear()
 
     async def _pixiv_token_refresh_loop(self):
         """Фоновое обновление access_token, чтобы Pixiv не отваливался через ~1 час."""
@@ -510,18 +386,18 @@ class Rule34Searcher(loader.Module):
             try:
                 await asyncio.sleep(self.PIXIV_ACCESS_TTL)
                 await utils.run_sync(lambda: self._ensure_pixiv_api_sync(force_refresh=True))
-                print("[Rule34Searcher] Pixiv access_token refreshed")
+                logger.debug("[Rule34Searcher] Pixiv access_token refreshed")
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"[Rule34Searcher] Pixiv background refresh failed: {e}")
+                logger.error(f"[Rule34Searcher] Pixiv background refresh failed: {e}")
 
     async def _warm_pixiv_api(self):
         """Заранее авторизоваться в Pixiv, чтобы первая команда не ждала auth."""
         try:
             await utils.run_sync(self._ensure_pixiv_api_sync)
         except Exception as e:
-            print(f"[Rule34Searcher] Pixiv warm-up failed: {e}")
+            logger.error(f"[Rule34Searcher] Pixiv warm-up failed: {e}")
 
     def _get_chat_id(self, peer_id) -> int:
         """Получить числовой ID чата из объекта Peer"""
@@ -548,104 +424,10 @@ class Rule34Searcher(loader.Module):
         """Сохранить вайтлист в БД"""
         self._db.set("Rule34Searcher", "chat_whitelist", list(self._chat_whitelist))
 
-    def _save_proxies(self):
-        """Сохранить рабочие прокси в файл"""
-        try:
-            proxy_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                self._proxy_file
-            )
-            with open(proxy_path, 'w', encoding='utf-8') as f:
-                json.dump(self._working_proxies, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
-    def _load_proxies(self):
-        """Загрузить рабочие прокси из файла"""
-        try:
-            proxy_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                self._proxy_file
-            )
-            if os.path.exists(proxy_path):
-                with open(proxy_path, 'r', encoding='utf-8') as f:
-                    self._working_proxies = json.load(f)
-        except Exception:
-            self._working_proxies = []
-
-    def _get_working_proxy(self, test_url: str = "https://api.rule34.xxx/") -> Optional[dict]:
-        """Получить рабочий прокси"""
-        try:
-            if not self._working_proxies:
-                self._load_proxies()
-            
-            if self._working_proxies:
-                random.shuffle(self._working_proxies)
-                
-                for proxy_info in self._working_proxies[:5]:
-                    proxy = proxy_info['proxy']
-                    proxy_dict = build_requests_proxies(proxy)
-                    if not proxy_dict:
-                        continue
-                    headers = get_request_headers(self.config["proxy_rotate_ua"])
-                    
-                    try:
-                        test_response = requests.get(test_url, proxies=proxy_dict, headers=headers, timeout=5)
-                        if test_response.status_code == 200:
-                            return proxy_dict
-                    except Exception:
-                        continue
-            
-            return None
-            
-        except Exception:
-            return None
-
-    async def _update_proxy_list(self):
-        """Обновить список прокси"""
-        def update_proxies_background():
-            try:
-                proxy_source = self.config["proxy_source"]
-                proxies = []
-                
-                if proxy_source == "url":
-                    url = self.config["proxy_source_url"]
-                    response = requests.get(url, timeout=10)
-                    response.raise_for_status()
-                    raw_proxies = [line.strip() for line in response.text.split('\n') if line.strip()]
-                    for proxy in raw_proxies:
-                        norm = normalize_proxy_url(proxy)
-                        if norm:
-                            proxies.append(norm)
-                
-                elif proxy_source == "manual":
-                    manual_list = self.config["proxy_manual_list"]
-                    raw_proxies = [line.strip() for line in manual_list.split('\n') if line.strip()]
-                    for proxy in raw_proxies:
-                        norm = normalize_proxy_url(proxy)
-                        if norm:
-                            proxies.append(norm)
-                
-                if proxies:
-                    working = check_proxies_parallel(proxies, max_workers=50, max_working=20)
-                    self._working_proxies = working
-                    self._save_proxies()
-                    return len(working)
-                
-                return 0
-            except Exception as e:
-                raise e
-        
-        try:
-            count = await utils.run_sync(update_proxies_background)
-            return count
-        except Exception as e:
-            raise e
-
-    async def _make_request(self, url: str, params: dict = None, use_proxy: bool = False) -> Optional[requests.Response]:
-        """Выполнить HTTP запрос с поддержкой прокси"""
+    async def _make_request(self, url: str, params: dict = None) -> Optional[requests.Response]:
+        """Выполнить HTTP запрос"""
         def _request():
-            headers = get_request_headers(self.config["proxy_rotate_ua"])
+            headers = get_request_headers()
             
             # Один быстрый запрос без повторов
             try:
@@ -653,17 +435,17 @@ class Rule34Searcher(loader.Module):
                 response.raise_for_status()
                 return response
             except Exception as e:
-                print(f"[Rule34Searcher] Request failed: {e}")
+                logger.error(f"[Rule34Searcher] Request failed: {e}")
                 raise e
         
         try:
             return await utils.run_sync(_request)
         except Exception as e:
-            print(f"[Rule34Searcher] _make_request exception: {e}")
+            logger.error(f"[Rule34Searcher] _make_request exception: {e}")
             return None
 
     async def _search_rule34(self, tags: str, limit: int = 100) -> List[Dict]:
-        """Поиск на Rule34 с полной поддержкой прокси и API"""
+        """Поиск на Rule34"""
         # Добавляем теги из конфига
         tags_in_setting = self.config["tags_in"]
         tags_ex_setting = self.config["tags_ex"]
@@ -718,7 +500,7 @@ class Rule34Searcher(loader.Module):
         # Убираем пустые параметры
         params = {k: v for k, v in params.items() if v is not None}
         
-        response = await self._make_request(url, params, use_proxy=True)
+        response = await self._make_request(url, params)
         if not response:
             return []
         
@@ -758,7 +540,7 @@ class Rule34Searcher(loader.Module):
             return posts
         except Exception as e:
             # Логируем ошибку для отладки
-            print(f"[Rule34Searcher] Error parsing Rule34 response: {e}")
+            logger.error(f"[Rule34Searcher] Error parsing Rule34 response: {e}")
             return []
 
     async def _search_danbooru(self, tags: str, limit: int = 100) -> List[Dict]:
@@ -785,22 +567,22 @@ class Rule34Searcher(loader.Module):
         # Убираем пустые параметры
         params = {k: v for k, v in params.items() if v is not None}
         
-        print(f"[Rule34Searcher] Danbooru request URL: {url}")
-        print(f"[Rule34Searcher] Danbooru params: {params}")
+        logger.debug(f"[Rule34Searcher] Danbooru request URL: {url}")
+        logger.debug(f"[Rule34Searcher] Danbooru params: {params}")
         
         # Используем специальный метод с HTTP Basic Auth
         response = await self._make_danbooru_request(url, params)
         if not response:
-            print(f"[Rule34Searcher] Danbooru: No response from API")
+            logger.debug(f"[Rule34Searcher] Danbooru: No response from API")
             return []
         
-        print(f"[Rule34Searcher] Danbooru response status: {response.status_code}")
-        print(f"[Rule34Searcher] Danbooru response text (first 500 chars): {response.text[:500]}")
+        logger.debug(f"[Rule34Searcher] Danbooru response status: {response.status_code}")
+        logger.debug(f"[Rule34Searcher] Danbooru response text (first 500 chars): {response.text[:500]}")
         
         try:
             # Парсим JSON ответ
             data = response.json()
-            print(f"[Rule34Searcher] Danbooru: Received {len(data)} posts")
+            logger.debug(f"[Rule34Searcher] Danbooru: Received {len(data)} posts")
             posts = []
             
             # Ключ для отслеживания повторов
@@ -818,7 +600,7 @@ class Rule34Searcher(loader.Module):
                 image_url = post.get('file_url') or post.get('large_file_url') or post.get('preview_file_url')
                 
                 if not image_url:
-                    print(f"[Rule34Searcher] Danbooru: Post {post_id} has no image URL")
+                    logger.debug(f"[Rule34Searcher] Danbooru: Post {post_id} has no image URL")
                     continue
                 
                 # Парсим теги
@@ -832,11 +614,11 @@ class Rule34Searcher(loader.Module):
                     "id": post_id,
                 })
             
-            print(f"[Rule34Searcher] Danbooru: Returning {len(posts)} posts after filtering")
+            logger.debug(f"[Rule34Searcher] Danbooru: Returning {len(posts)} posts after filtering")
             return posts
         except Exception as e:
             # Логируем ошибку для отладки
-            print(f"[Rule34Searcher] Error parsing Danbooru response: {e}")
+            logger.error(f"[Rule34Searcher] Error parsing Danbooru response: {e}")
             import traceback
             traceback.print_exc()
             return []
@@ -1058,7 +840,7 @@ class Rule34Searcher(loader.Module):
         manga_only: bool = False,
     ) -> List[Dict]:
         if not self._get_pixiv_refresh_token():
-            print("[Rule34Searcher] Pixiv: refresh_token not configured")
+            logger.debug("[Rule34Searcher] Pixiv: refresh_token not configured")
             return []
 
         fetch_limit = limit if limit is not None else self._pixiv_fetch_limit(send_count)
@@ -1076,13 +858,13 @@ class Rule34Searcher(loader.Module):
                     )
                 except Exception as e:
                     last_error = e
-                    print(f"[Rule34Searcher] Pixiv search attempt {attempt + 1} failed: {e}")
+                    logger.error(f"[Rule34Searcher] Pixiv search attempt {attempt + 1} failed: {e}")
                     self._reset_pixiv_api()
                     if attempt < 2:
                         try:
                             self._ensure_pixiv_api_sync(force_refresh=True)
                         except Exception as auth_err:
-                            print(f"[Rule34Searcher] Pixiv re-auth failed: {auth_err}")
+                            logger.error(f"[Rule34Searcher] Pixiv re-auth failed: {auth_err}")
             if last_error:
                 raise last_error
             return []
@@ -1090,13 +872,13 @@ class Rule34Searcher(loader.Module):
         try:
             return await utils.run_sync(_run_search)
         except Exception as e:
-            print(f"[Rule34Searcher] Pixiv search error: {e}")
+            logger.error(f"[Rule34Searcher] Pixiv search error: {e}")
             import traceback
             traceback.print_exc()
             return []
 
     def _download_pixiv_image_sync(self, url: str) -> bytes:
-        headers = get_request_headers(self.config["proxy_rotate_ua"])
+        headers = get_request_headers()
         headers["Referer"] = PIXIV_REFERER
         response = requests.get(url, headers=headers, timeout=45)
         response.raise_for_status()
@@ -1155,7 +937,7 @@ class Rule34Searcher(loader.Module):
                     raw = self._download_pixiv_image_sync(page_url)
                     pages_data.append(raw)
             except Exception as e:
-                print(f"[Rule34Searcher] Manga download failed for {post_id}: {e}")
+                logger.error(f"[Rule34Searcher] Manga download failed for {post_id}: {e}")
                 continue
 
             if len(pages_data) < 2:
@@ -1182,7 +964,7 @@ class Rule34Searcher(loader.Module):
                 max_pages,
             )
         except Exception as e:
-            print(f"[Rule34Searcher] Pixiv manga error: {e}")
+            logger.error(f"[Rule34Searcher] Pixiv manga error: {e}")
             import traceback
             traceback.print_exc()
             err = str(e)
@@ -1267,13 +1049,13 @@ class Rule34Searcher(loader.Module):
                 response.raise_for_status()
                 return response
             except Exception as e:
-                print(f"[Rule34Searcher] Danbooru request failed: {e}")
+                logger.error(f"[Rule34Searcher] Danbooru request failed: {e}")
                 raise e
         
         try:
             return await utils.run_sync(_request)
         except Exception as e:
-            print(f"[Rule34Searcher] _make_danbooru_request exception: {e}")
+            logger.error(f"[Rule34Searcher] _make_danbooru_request exception: {e}")
             return None
 
     def _format_caption(self, post: Dict, requested_tags: str) -> str:
@@ -1284,14 +1066,14 @@ class Rule34Searcher(loader.Module):
         """Скачать файл по URL"""
         try:
             def _download():
-                headers = get_request_headers(self.config["proxy_rotate_ua"])
+                headers = get_request_headers()
                 response = requests.get(url, headers=headers, timeout=30)
                 response.raise_for_status()
                 return response.content
             
             return await utils.run_sync(_download)
         except Exception as e:
-            print(f"[Rule34Searcher] Error downloading file: {e}")
+            logger.error(f"[Rule34Searcher] Error downloading file: {e}")
             return None
 
     def _video_has_audio(self, url: str) -> bool:
@@ -1299,8 +1081,6 @@ class Rule34Searcher(loader.Module):
         # Делается через ffprobe прямо по URL (без полной загрузки файла).
         # При любой неудаче возвращаем True, чтобы не тормозить отправку:
         # такое видео уйдёт по URL как раньше.
-        import shutil
-        import subprocess
         if not shutil.which("ffprobe"):
             return True
         try:
@@ -1320,7 +1100,7 @@ class Rule34Searcher(loader.Module):
                 return True
             return bool(probe.stdout.strip())
         except Exception as e:
-            print(f"[Rule34Searcher] ffprobe url failed: {e}")
+            logger.error(f"[Rule34Searcher] ffprobe url failed: {e}")
             return True
 
     def _make_streamable_mp4(self, media_bytes: bytes, ext: str) -> Optional[bytes]:
@@ -1329,11 +1109,9 @@ class Rule34Searcher(loader.Module):
         # тихую аудиодорожку. Чтобы было быстро, видеопоток по возможности
         # копируем без перекодирования (-c:v copy); полный libx264 — только если
         # копирование невозможно (например, .gif или .webm). Нужен ffmpeg.
-        import shutil
-        import subprocess
         ext = (ext or "").lower()
         if not shutil.which("ffmpeg"):
-            print("[Rule34Searcher] ffmpeg не найден — отправляю медиа как есть")
+            logger.debug("[Rule34Searcher] ffmpeg не найден — отправляю медиа как есть")
             return media_bytes if ext == "mp4" else None
         tmp_in = None
         tmp_out = None
@@ -1385,12 +1163,12 @@ class Rule34Searcher(loader.Module):
             if result is None or result.returncode != 0:
                 result = subprocess.run(build(False), capture_output=True, timeout=300)
             if result.returncode != 0:
-                print(f"[Rule34Searcher] ffmpeg error: {result.stderr.decode(errors='ignore')[:300]}")
+                logger.error(f"[Rule34Searcher] ffmpeg error: {result.stderr.decode(errors='ignore')[:300]}")
                 return media_bytes if ext == "mp4" else None
             with open(tmp_out, "rb") as f:
                 return f.read()
         except Exception as e:
-            print(f"[Rule34Searcher] _make_streamable_mp4 failed: {e}")
+            logger.error(f"[Rule34Searcher] _make_streamable_mp4 failed: {e}")
             return media_bytes if ext == "mp4" else None
         finally:
             for p in (tmp_in, tmp_out):
@@ -1402,8 +1180,6 @@ class Rule34Searcher(loader.Module):
 
     def _probe_video_meta(self, media_bytes: bytes):
         """Вернуть (width, height, duration) видео через ffprobe или (0, 0, 0)."""
-        import shutil
-        import subprocess
         if not shutil.which("ffprobe"):
             return (0, 0, 0)
         tmp_in = None
@@ -1428,7 +1204,7 @@ class Rule34Searcher(loader.Module):
             dur = int(float(nums[2])) if len(nums) >= 3 and nums[2].strip() else 0
             return (w, h, dur)
         except Exception as e:
-            print(f"[Rule34Searcher] _probe_video_meta failed: {e}")
+            logger.error(f"[Rule34Searcher] _probe_video_meta failed: {e}")
             return (0, 0, 0)
         finally:
             if tmp_in and os.path.exists(tmp_in):
@@ -1437,7 +1213,91 @@ class Rule34Searcher(loader.Module):
                 except Exception:
                     pass
 
-    async def _send_media_spoiler(self, message, media_bytes, filename, caption, is_video):
+    def _prepare_video_local(self, media_bytes: bytes, ext: str):
+        """Один локальный проход: ffprobe (звук + размеры + длительность),
+        при необходимости ffmpeg. Возвращает (mp4_bytes|None, w, h, dur).
+        Используется для спойлера, где файл уже скачан — чтобы не делать
+        сетевой ffprobe и не гонять ffprobe несколько раз."""
+        ext = (ext or "").lower()
+        w = h = dur = 0
+        has_audio = False
+        if not shutil.which("ffmpeg"):
+            return (media_bytes if ext == "mp4" else None, 0, 0, 0)
+        tmp_in = None
+        tmp_out = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix="." + ext, delete=False) as f_in:
+                f_in.write(media_bytes)
+                tmp_in = f_in.name
+            if shutil.which("ffprobe"):
+                probe = subprocess.run(
+                    [
+                        "ffprobe", "-v", "error",
+                        "-show_entries", "stream=codec_type,width,height:format=duration",
+                        "-of", "json",
+                        tmp_in,
+                    ],
+                    capture_output=True, timeout=60,
+                )
+                try:
+                    info = json.loads(probe.stdout.decode(errors="ignore") or "{}")
+                    for st in info.get("streams", []):
+                        if st.get("codec_type") == "audio":
+                            has_audio = True
+                        if st.get("codec_type") == "video":
+                            w = int(st.get("width") or 0)
+                            h = int(st.get("height") or 0)
+                    dur = int(float(info.get("format", {}).get("duration") or 0))
+                except Exception:
+                    pass
+            if ext == "mp4" and has_audio:
+                return (media_bytes, w, h, dur)
+            tmp_out = tmp_in + ".out.mp4"
+
+            def build(copy_video):
+                cmd = ["ffmpeg", "-y", "-i", tmp_in]
+                if not has_audio:
+                    cmd += [
+                        "-f", "lavfi",
+                        "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                        "-shortest",
+                    ]
+                cmd += ["-movflags", "+faststart"]
+                if copy_video:
+                    cmd += ["-c:v", "copy"]
+                else:
+                    cmd += [
+                        "-pix_fmt", "yuv420p",
+                        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                        "-c:v", "libx264",
+                        "-preset", "veryfast",
+                    ]
+                cmd += ["-c:a", "aac", tmp_out]
+                return cmd
+
+            result = None
+            if ext in ("mp4", "mov", "mkv"):
+                result = subprocess.run(build(True), capture_output=True, timeout=300)
+            if result is None or result.returncode != 0:
+                result = subprocess.run(build(False), capture_output=True, timeout=300)
+            if result.returncode != 0:
+                err = result.stderr.decode("utf-8", "ignore")[:300]
+                logger.error(f"[Rule34Searcher] _prepare_video_local ffmpeg error: {err}")
+                return (media_bytes if ext == "mp4" else None, w, h, dur)
+            with open(tmp_out, "rb") as f:
+                return (f.read(), w, h, dur)
+        except Exception as e:
+            logger.error(f"[Rule34Searcher] _prepare_video_local failed: {e}")
+            return (media_bytes if ext == "mp4" else None, w, h, dur)
+        finally:
+            for p in (tmp_in, tmp_out):
+                if p and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+
+    async def _send_media_spoiler(self, message, media_bytes, filename, caption, is_video, meta=None):
         """Отправить медиа со СПОЙЛЕРОМ через raw API.
         Спойлер в Telegram работает только для ЗАГРУЖЕННЫХ медиа (не по URL),
         а обычный spoiler= в send_file ненадёжен, поэтому используем
@@ -1459,7 +1319,10 @@ class Rule34Searcher(loader.Module):
             if is_video:
                 attributes = []
                 if DocumentAttributeVideo:
-                    w, h, dur = await utils.run_sync(self._probe_video_meta, media_bytes)
+                    if meta is not None:
+                        w, h, dur = meta
+                    else:
+                        w, h, dur = await utils.run_sync(self._probe_video_meta, media_bytes)
                     attributes.append(
                         DocumentAttributeVideo(
                             duration=dur, w=w, h=h, supports_streaming=True
@@ -1491,17 +1354,17 @@ class Rule34Searcher(loader.Module):
             except Exception:
                 return result
         except Exception as e:
-            print(f"[Rule34Searcher] _send_media_spoiler failed: {e}")
+            logger.error(f"[Rule34Searcher] _send_media_spoiler failed: {e}")
             return None
 
     async def _send_posts(self, message: Message, posts: List[Dict], requested_tags: str, count: int):
         """Отправка постов (изображения и видео)"""
         if not posts:
-            print(f"[Rule34Searcher] _send_posts: No posts provided")
+            logger.debug(f"[Rule34Searcher] _send_posts: No posts provided")
             await utils.answer(message, self.strings("not_found"))
             return
         
-        print(f"[Rule34Searcher] _send_posts: Received {len(posts)} posts, need to send {count}")
+        logger.debug(f"[Rule34Searcher] _send_posts: Received {len(posts)} posts, need to send {count}")
         
         # Перемешиваем посты для случайности
         random.shuffle(posts)
@@ -1520,7 +1383,7 @@ class Rule34Searcher(loader.Module):
                 break
                 
             if attempts >= max_attempts:
-                print(f"[Rule34Searcher] Reached max attempts ({max_attempts})")
+                logger.debug(f"[Rule34Searcher] Reached max attempts ({max_attempts})")
                 break
                 
             attempts += 1
@@ -1529,12 +1392,12 @@ class Rule34Searcher(loader.Module):
             post_id = post.get("id", "")
             
             if not file_url:
-                print(f"[Rule34Searcher] Post {post_id} has no file_url")
+                logger.debug(f"[Rule34Searcher] Post {post_id} has no file_url")
                 continue
             
             # Проверяем не показывали ли недавно
             if post_id in recent_ids:
-                print(f"[Rule34Searcher] Post {post_id} was recently shown, skipping")
+                logger.debug(f"[Rule34Searcher] Post {post_id} was recently shown, skipping")
                 continue
             
             caption = self._format_caption(post, requested_tags)
@@ -1544,7 +1407,7 @@ class Rule34Searcher(loader.Module):
                 file_ext = file_url.lower().split('?')[0].split('.')[-1]
                 is_video = file_ext in ['mp4', 'webm', 'gif', 'mov', 'avi', 'mkv']
                 
-                print(f"[Rule34Searcher] Attempt {attempts}: Sending {file_ext} file (video={is_video}): {file_url[:80]}...")
+                logger.debug(f"[Rule34Searcher] Attempt {attempts}: Sending {file_ext} file (video={is_video}): {file_url[:80]}...")
                 
                 # Видео отправляем так, чтобы Telegram не показывал его как гифку.
                 # Telegram считает анимацией .gif и любое видео без аудиодорожки.
@@ -1559,8 +1422,21 @@ class Rule34Searcher(loader.Module):
                 # Готовим видео так, чтобы Telegram не показывал его как гифку.
                 # .gif всегда перекодируем; для остальных проверяем звук по сети
                 # и трогаем файл только если звука нет.
-                video_bytes = None  # mp4-байты, если видео пришлось готовить
-                if is_video_ext:
+                video_bytes = None  # готовые mp4-байты
+                video_meta = None   # (w, h, dur) для корректного вида видео
+                if spoiler and is_video_ext:
+                    # Спойлер всё равно требует загрузки файла, поэтому НЕ делаем
+                    # сетевой ffprobe: качаем один раз и обрабатываем локально
+                    # ОДНИМ проходом (звук + размеры + при необходимости ffmpeg).
+                    raw = await self._download_file(file_url)
+                    if raw is not None:
+                        prepared, vw, vh, vdur = await utils.run_sync(
+                            self._prepare_video_local, raw, file_ext
+                        )
+                        if prepared is not None:
+                            video_bytes = prepared
+                            video_meta = (vw, vh, vdur)
+                elif is_video_ext:
                     if file_ext == "gif":
                         needs_fix = True
                     else:
@@ -1578,12 +1454,10 @@ class Rule34Searcher(loader.Module):
                 if spoiler:
                     # СПОЙЛЕР: медиа нужно ЗАГРУЗИТЬ (по URL спойлер не работает).
                     if is_video_ext:
-                        vb = video_bytes
-                        if vb is None:
-                            vb = await self._download_file(file_url)
-                        if vb is not None:
+                        if video_bytes is not None:
                             sent_msg = await self._send_media_spoiler(
-                                message, vb, f"{post_id or 'video'}.mp4", caption, True
+                                message, video_bytes, f"{post_id or 'video'}.mp4",
+                                caption, True, meta=video_meta
                             )
                     else:
                         img_bytes = await self._download_file(file_url)
@@ -1626,19 +1500,19 @@ class Rule34Searcher(loader.Module):
                 if post_id:
                     recent_ids.append(post_id)
                 
-                print(f"[Rule34Searcher] Successfully sent post {post_id} ({sent_count}/{count})")
+                logger.debug(f"[Rule34Searcher] Successfully sent post {post_id} ({sent_count}/{count})")
                     
             except Exception as e:
                 # Логируем ошибку для отладки
                 error_msg = str(e)
-                print(f"[Rule34Searcher] Error sending file {file_url[:80]}...: {error_msg}")
+                logger.error(f"[Rule34Searcher] Error sending file {file_url[:80]}...: {error_msg}")
                 import traceback
                 traceback.print_exc()
                 
                 # Пропускаем этот пост и пробуем следующий
                 continue
         
-        print(f"[Rule34Searcher] Finished: sent {sent_count}/{count}, attempts {attempts}/{max_attempts}")
+        logger.debug(f"[Rule34Searcher] Finished: sent {sent_count}/{count}, attempts {attempts}/{max_attempts}")
         
         if sent_count == 0:
             await utils.answer(
@@ -1653,12 +1527,143 @@ class Rule34Searcher(loader.Module):
             await message.delete()
 
             if self.config["auto_delete"] and self.config["auto_delete_delay"] > 0:
-                await asyncio.sleep(self.config["auto_delete_delay"])
-                for msg in sent_messages:
-                    try:
-                        await msg.delete()
-                    except Exception:
-                        pass
+                self._spawn_task(
+                    self._auto_delete_later(sent_messages, self.config["auto_delete_delay"])
+                )
+
+    async def _auto_delete_later(self, messages, delay):
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        for msg in messages:
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+
+    def _spawn_task(self, coro):
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
+
+    def _format_version(self, version):
+        if not isinstance(version, (tuple, list)):
+            return str(version)
+        return ".".join(map(str, version))
+
+    def _parse_remote_version(self, module_source):
+        match = re.search(r"__version__\s*=\s*\(([^)]+)\)", module_source)
+        if not match:
+            return None
+        parts = [p.strip() for p in match.group(1).split(",") if p.strip()]
+        try:
+            version = tuple(int(p) for p in parts)
+        except ValueError:
+            return None
+        return version if len(version) == 3 else None
+
+    def _parse_remote_diff(self, module_source):
+        match = re.search(
+            r"#\s*diff:\s*(.*?)(?=\r?\n#|\r?\n\r?\n|$)",
+            module_source,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return ""
+        return re.sub(r"\s+", " ", match.group(1).strip())[:1200]
+
+    def _fetch_remote_module_info_sync(self):
+        resp = requests.get(
+            self.update_source_url,
+            headers={"Cache-Control": "no-cache"},
+            params={"t": int(time.time())},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            logger.warning("[Rule34Searcher] Update check HTTP %s", resp.status_code)
+            return None, ""
+        resp.encoding = "utf-8"
+        src = resp.text
+        return self._parse_remote_version(src), self._parse_remote_diff(src)
+
+    def _update_notice_is_due(self, remote_version):
+        notice = self._db.get("Rule34Searcher", "update_notice", {}) or {}
+        if not isinstance(notice, dict):
+            return True
+        if notice.get("version") != list(remote_version):
+            return True
+        try:
+            return time.time() - float(notice.get("sent_at", 0)) >= self.update_notice_repeat_interval
+        except (TypeError, ValueError):
+            return True
+
+    def _mark_update_notice_sent(self, remote_version):
+        self._db.set(
+            "Rule34Searcher",
+            "update_notice",
+            {"version": list(remote_version), "sent_at": int(time.time())},
+        )
+
+    async def _send_update_notice(self, text):
+        try:
+            await self.inline.bot.send_message(self.tg_id, text, disable_web_page_preview=True)
+            return True
+        except Exception as e:
+            logger.debug("[Rule34Searcher] Inline update notice failed: %s", e)
+        try:
+            await self.client.send_message("me", text, link_preview=False)
+            return True
+        except Exception as e:
+            logger.debug("[Rule34Searcher] Saved Messages update notice failed: %s", e)
+            return False
+
+    async def _check_module_update(self):
+        try:
+            async with self._update_notice_lock:
+                remote_version, diff = await utils.run_sync(self._fetch_remote_module_info_sync)
+                if not remote_version:
+                    return False
+                if remote_version <= __version__:
+                    if remote_version == __version__:
+                        self._db.set("Rule34Searcher", "update_notice", {})
+                    return False
+                if not self._update_notice_is_due(remote_version):
+                    return False
+                install_command = f"{self.get_prefix()}dlm {self.update_source_url}"
+                diff_text = (
+                    "\n\n<b>\u0427\u0442\u043e \u043d\u043e\u0432\u043e\u0433\u043e:</b>\n<blockquote expandable>{}</blockquote>".format(
+                        utils.escape_html(diff)
+                    )
+                    if diff
+                    else ""
+                )
+                text = (
+                    "\U0001F195 <b>\u041e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u0435 Rule34Searcher</b>\n\n"
+                    f"<code>{self._format_version(__version__)}</code> -> "
+                    f"<code>{self._format_version(remote_version)}</code>{diff_text}\n\n"
+                    f"<b>\u0423\u0441\u0442\u0430\u043d\u043e\u0432\u043a\u0430:</b>\n<code>{utils.escape_html(install_command)}</code>"
+                )
+                if await self._send_update_notice(text):
+                    self._mark_update_notice_sent(remote_version)
+                    return True
+                return False
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("[Rule34Searcher] Update check failed: %s", e)
+            return False
+
+    async def _update_check_loop(self):
+        while True:
+            try:
+                await self._check_module_update()
+                await asyncio.sleep(self.update_check_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.exception(e)
 
     def _prune_spam_events(self, events, current_time, window):
         """Очистка старых событий спама"""
@@ -1929,7 +1934,7 @@ class Rule34Searcher(loader.Module):
                 return
                 
         except Exception as e:
-            print(f"[Rule34Searcher] Watcher error: {e}")
+            logger.error(f"[Rule34Searcher] Watcher error: {e}")
 
     @loader.command(
         ru_doc="Управление вайтлистом чатов",
@@ -2070,20 +2075,6 @@ class Rule34Searcher(loader.Module):
         )
 
     @loader.command(
-        ru_doc="Обновить список прокси",
-        en_doc="Update proxy list",
-    )
-    async def updateproxycmd(self, message: Message):
-        """Обновить список прокси"""
-        await utils.answer(message, self.strings("proxy_update_started"))
-        
-        try:
-            count = await self._update_proxy_list()
-            await utils.answer(message, self.strings("proxy_update_success").format(count))
-        except Exception as e:
-            await utils.answer(message, self.strings("proxy_update_error").format(str(e)))
-
-    @loader.command(
         ru_doc="Тест API Rule34",
         en_doc="Test Rule34 API",
     )
@@ -2106,7 +2097,7 @@ class Rule34Searcher(loader.Module):
             'user_id': '5255009'
         }
         
-        response = await self._make_request(url, params, use_proxy=True)
+        response = await self._make_request(url, params)
         
         if not response:
             await utils.answer(message, "❌ Не удалось получить ответ от API")
