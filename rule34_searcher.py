@@ -1,5 +1,5 @@
-__version__ = (2, 0, 1)
-# diff: Трекинг фоновых задач + отмена в on_unload, авто-нотификатор обновлений; ранее: вырезан proxy, print->logging, дедуп импортов, фоновое автоудаление.
+__version__ = (2, 0, 5)
+# diff: Триггеры больше не реплаят на сообщение, которому отвечал автор; Pixiv auth таймаут 30с + 3 ретрая; ранее: трекинг задач, авто-нотификатор.
 # meta developer: @dubstep_namaz1337
 # meta banner: https://raw.githubusercontent.com/emeliaezz1488-lab/heroku-modules-by-dubstep-namaz/main/Banners/logo.png
 # requires: pixivpy3
@@ -61,6 +61,7 @@ from .. import loader, utils
 PIXIV_REFERER = "https://www.pixiv.net/"
 
 logger = logging.getLogger(__name__)
+_KEEP_REPLY = object()
 
 # User-Agent список для ротации
 USER_AGENTS = [
@@ -970,7 +971,7 @@ class Rule34Searcher(loader.Module):
 
         return None
 
-    async def _send_pixiv_manga_album(self, message: Message, tags: str):
+    async def _send_pixiv_manga_album(self, message: Message, tags: str, reply_to_id=_KEEP_REPLY):
         max_pages = self.config["pixiv_manga_max_pages"]
 
         try:
@@ -1008,7 +1009,7 @@ class Rule34Searcher(loader.Module):
             files,
             caption=caption,
             parse_mode="html",
-            reply_to=getattr(message, "reply_to_msg_id", None),
+            reply_to=getattr(message, "reply_to_msg_id", None) if reply_to_id is _KEEP_REPLY else reply_to_id,
             spoiler=self.config["spoiler_media"],
         )
 
@@ -1313,7 +1314,7 @@ class Rule34Searcher(loader.Module):
                     except Exception:
                         pass
 
-    async def _send_media_spoiler(self, message, media_bytes, filename, caption, is_video, meta=None):
+    async def _send_media_spoiler(self, message, media_bytes, filename, caption, is_video, meta=None, reply_to_id=_KEEP_REPLY):
         """Отправить медиа со СПОЙЛЕРОМ через raw API.
         Спойлер в Telegram работает только для ЗАГРУЖЕННЫХ медиа (не по URL),
         а обычный spoiler= в send_file ненадёжен, поэтому используем
@@ -1328,7 +1329,7 @@ class Rule34Searcher(loader.Module):
                 text, entities = message.client.parse_mode.parse(caption or "")
             except Exception:
                 text, entities = caption or "", []
-            reply_to = getattr(message, "reply_to_msg_id", None)
+            reply_to = getattr(message, "reply_to_msg_id", None) if reply_to_id is _KEEP_REPLY else reply_to_id
             request_reply_to = reply_to
             if reply_to is not None and InputReplyToMessage and isinstance(reply_to, int):
                 request_reply_to = InputReplyToMessage(reply_to_msg_id=reply_to)
@@ -1373,8 +1374,9 @@ class Rule34Searcher(loader.Module):
             logger.error(f"[Rule34Searcher] _send_media_spoiler failed: {e}")
             return None
 
-    async def _send_posts(self, message: Message, posts: List[Dict], requested_tags: str, count: int):
+    async def _send_posts(self, message: Message, posts: List[Dict], requested_tags: str, count: int, reply_to_id=_KEEP_REPLY):
         """Отправка постов (изображения и видео)"""
+        resolved_reply_to = getattr(message, "reply_to_msg_id", None) if reply_to_id is _KEEP_REPLY else reply_to_id
         if not posts:
             logger.debug(f"[Rule34Searcher] _send_posts: No posts provided")
             await utils.answer(message, self.strings("not_found"))
@@ -1473,7 +1475,7 @@ class Rule34Searcher(loader.Module):
                         if video_bytes is not None:
                             sent_msg = await self._send_media_spoiler(
                                 message, video_bytes, f"{post_id or 'video'}.mp4",
-                                caption, True, meta=video_meta
+                                caption, True, meta=video_meta, reply_to_id=reply_to_id
                             )
                     else:
                         img_bytes = await self._download_file(file_url)
@@ -1481,7 +1483,7 @@ class Rule34Searcher(loader.Module):
                             safe_ext = file_ext if file_ext.isalnum() else "jpg"
                             sent_msg = await self._send_media_spoiler(
                                 message, img_bytes,
-                                f"{post_id or 'image'}.{safe_ext}", caption, False
+                                f"{post_id or 'image'}.{safe_ext}", caption, False, reply_to_id=reply_to_id
                             )
 
                 if sent_msg is None and video_bytes is not None:
@@ -1493,7 +1495,7 @@ class Rule34Searcher(loader.Module):
                         bio,
                         caption=caption,
                         parse_mode="html",
-                        reply_to=getattr(message, "reply_to_msg_id", None),
+                        reply_to=resolved_reply_to,
                         supports_streaming=True,
                         force_document=False,
                     )
@@ -1505,7 +1507,7 @@ class Rule34Searcher(loader.Module):
                         file_url,
                         caption=caption,
                         parse_mode="html",
-                        reply_to=getattr(message, "reply_to_msg_id", None),
+                        reply_to=resolved_reply_to,
                         supports_streaming=is_video_ext,
                     )
 
@@ -1802,7 +1804,7 @@ class Rule34Searcher(loader.Module):
             return
         
         # Отправка одного поста с правильным тегом для подписи
-        await self._send_posts(message, posts, display_tag, 1)
+        await self._send_posts(message, posts, display_tag, 1, reply_to_id=None)
 
     async def _search_and_send_r34_chat(self, message: Message, args: str):
         """Поиск по триггеру «r34 [теги] [кол-во]» в чате."""
@@ -1817,7 +1819,7 @@ class Rule34Searcher(loader.Module):
             return
 
         posts = await self._search_rule34(tags, self.config["posts_count"])
-        await self._send_posts(message, posts, tags, count)
+        await self._send_posts(message, posts, tags, count, reply_to_id=None)
 
     async def _search_and_send_pixiv_chat(self, message: Message, args: str):
         """Поиск по триггеру «pixiv [теги] [кол-во]» в чате."""
@@ -1835,7 +1837,7 @@ class Rule34Searcher(loader.Module):
             return
 
         posts = await self._search_pixiv(tags, send_count=count)
-        await self._send_posts(message, posts, tags, count)
+        await self._send_posts(message, posts, tags, count, reply_to_id=None)
 
     async def _search_and_send_pixiv_nsfw_chat(self, message: Message, args: str):
         """Поиск по триггеру «pixivnsfw [теги] [кол-во]»."""
@@ -1853,7 +1855,7 @@ class Rule34Searcher(loader.Module):
             return
 
         posts = await self._search_pixiv(tags, send_count=count, r18_only=True)
-        await self._send_posts(message, posts, tags, count)
+        await self._send_posts(message, posts, tags, count, reply_to_id=None)
 
     async def _send_pixiv_manga_chat(self, message: Message, args: str):
         """Поиск по триггеру «pixivmanga [теги]»."""
@@ -1870,7 +1872,7 @@ class Rule34Searcher(loader.Module):
         if not tags:
             return
 
-        await self._send_pixiv_manga_album(message, tags)
+        await self._send_pixiv_manga_album(message, tags, reply_to_id=None)
 
     @loader.watcher()
     async def watcher(self, message: Message):
