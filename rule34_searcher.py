@@ -63,6 +63,12 @@ PIXIV_REFERER = "https://www.pixiv.net/"
 logger = logging.getLogger(__name__)
 _KEEP_REPLY = object()
 
+# Предкомпилированные регулярные выражения для оптимизации воркера
+RE_R34 = re.compile(r"^r34\s+(.+)$", re.IGNORECASE)
+RE_PIXIV_NSFW = re.compile(r"^pixivnsfw\s+(.+)$", re.IGNORECASE)
+RE_PIXIV_MANGA = re.compile(r"^pixivmanga\s+(.+)$", re.IGNORECASE)
+RE_PIXIV = re.compile(r"^pixiv\s+(.+)$", re.IGNORECASE)
+
 # User-Agent список для ротации
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -320,7 +326,7 @@ class Rule34Searcher(loader.Module):
                 validator=loader.validators.Integer(minimum=2, maximum=100),
             ),
         )
-        self._cache = {}
+        self._session = requests.Session()
         self._pixiv_api = None
         self._pixiv_token_cached = ""
         self._pixiv_auth_at = 0.0
@@ -359,10 +365,12 @@ class Rule34Searcher(loader.Module):
             "порно": "video"  # специальный маркер для видео
         }
 
-    async def client_ready(self, client, db):
+    async def client_ready(self, client=None, db=None):
         """Инициализация при запуске"""
-        self.client = client
-        self._db = db
+        if client is not None:
+            self.client = client
+        if db is not None:
+            self._db = db
         # Загружаем вайтлист из БД
         self._chat_whitelist = set(self._db.get("Rule34Searcher", "chat_whitelist", []))
         if self._get_pixiv_refresh_token():
@@ -380,6 +388,11 @@ class Rule34Searcher(loader.Module):
         for task in tuple(self._bg_tasks):
             task.cancel()
         self._bg_tasks.clear()
+        if hasattr(self, "_session") and self._session:
+            try:
+                self._session.close()
+            except Exception:
+                pass
 
     async def _pixiv_token_refresh_loop(self):
         """Фоновое обновление access_token, чтобы Pixiv не отваливался через ~1 час."""
@@ -432,7 +445,8 @@ class Rule34Searcher(loader.Module):
             
             # Один быстрый запрос без повторов
             try:
-                response = requests.get(url, params=params, headers=headers, timeout=5)
+                session = getattr(self, "_session", None) or requests
+                response = session.get(url, params=params, headers=headers, timeout=5)
                 response.raise_for_status()
                 return response
             except Exception as e:
@@ -470,12 +484,9 @@ class Rule34Searcher(loader.Module):
         all_exclude_tags = tags_ex_setting.split("; ") + exclude_tags
         tags_ex = [tag.strip() for tag in all_exclude_tags if tag.strip()]
         
-        # Добавляем анти-AI теги только если включено
+        # Добавляем только базовый тег в запрос, чтобы не сломать лимит тегов API Booru (остальные фильтруются локально)
         if antiai:
-            anti_ai_tags = ['-ai_generated', '-stable_diffusion', '-midjourney', '-artificial_intelligence', 
-                          '-neural_network', '-machine_learning', '-deepfake', '-ai_art', '-ai-generated', 
-                          '-generated_by_ai', '-dall_e', '-dalle', '-novelai', '-waifu_diffusion']
-            search_tags += ' ' + ' '.join(anti_ai_tags)
+            search_tags += ' -ai_generated' 
         
         # Добавляем исключающие теги в запрос
         if tags_ex:
@@ -530,6 +541,16 @@ class Rule34Searcher(loader.Module):
                 # Парсим теги
                 tags_str = post.get('tags', '')
                 tags_list = tags_str.split() if tags_str else []
+                
+                # Клиентская фильтрация остальных AI-тегов без переполнения лимита запроса
+                if antiai:
+                    ai_blacklist = {
+                        'ai_generated', 'stable_diffusion', 'midjourney', 'artificial_intelligence', 
+                        'neural_network', 'machine_learning', 'deepfake', 'ai_art', 'ai-generated', 
+                        'generated_by_ai', 'dall_e', 'dalle', 'novelai', 'waifu_diffusion'
+                    }
+                    if any(t.lower() in ai_blacklist for t in tags_list):
+                        continue
                 
                 posts.append({
                     "file_url": image_url,
@@ -897,7 +918,8 @@ class Rule34Searcher(loader.Module):
     def _download_pixiv_image_sync(self, url: str) -> bytes:
         headers = get_request_headers()
         headers["Referer"] = PIXIV_REFERER
-        response = requests.get(url, headers=headers, timeout=45)
+        session = getattr(self, "_session", None) or requests
+        response = session.get(url, headers=headers, timeout=45)
         response.raise_for_status()
         data = response.content
         if len(data) < 128:
@@ -1062,7 +1084,8 @@ class Rule34Searcher(loader.Module):
                 from requests.auth import HTTPBasicAuth
                 auth = HTTPBasicAuth('DubstepNamaz', '5qAAyDRZ22DFp8thwVXqGrfk')
                 
-                response = requests.get(url, params=params, headers=headers, auth=auth, timeout=10)
+                session = getattr(self, "_session", None) or requests
+                response = session.get(url, params=params, headers=headers, auth=auth, timeout=10)
                 response.raise_for_status()
                 return response
             except Exception as e:
@@ -1084,7 +1107,8 @@ class Rule34Searcher(loader.Module):
         try:
             def _download():
                 headers = get_request_headers()
-                response = requests.get(url, headers=headers, timeout=30)
+                session = getattr(self, "_session", None) or requests
+                response = session.get(url, headers=headers, timeout=30)
                 response.raise_for_status()
                 return response.content
             
@@ -1111,7 +1135,7 @@ class Rule34Searcher(loader.Module):
                     "-of", "csv=p=0",
                     url,
                 ],
-                capture_output=True, timeout=30,
+                capture_output=True, timeout=10,
             )
             if probe.returncode != 0:
                 return True
@@ -1154,7 +1178,7 @@ class Rule34Searcher(loader.Module):
             tmp_out = tmp_in + ".out.mp4"
 
             def build(copy_video):
-                cmd = ["ffmpeg", "-y", "-i", tmp_in]
+                cmd = ["ffmpeg", "-y", "-threads", "2", "-i", tmp_in]
                 if not has_audio:
                     cmd += [
                         "-f", "lavfi",
@@ -1272,7 +1296,7 @@ class Rule34Searcher(loader.Module):
             tmp_out = tmp_in + ".out.mp4"
 
             def build(copy_video):
-                cmd = ["ffmpeg", "-y", "-i", tmp_in]
+                cmd = ["ffmpeg", "-y", "-threads", "2", "-i", tmp_in]
                 if not has_audio:
                     cmd += [
                         "-f", "lavfi",
@@ -1472,6 +1496,8 @@ class Rule34Searcher(loader.Module):
                 if spoiler:
                     # СПОЙЛЕР: медиа нужно ЗАГРУЗИТЬ (по URL спойлер не работает).
                     if is_video_ext:
+                        if video_bytes is None:
+                            video_bytes = await self._download_file(file_url)
                         if video_bytes is not None:
                             sent_msg = await self._send_media_spoiler(
                                 message, video_bytes, f"{post_id or 'video'}.mp4",
@@ -1511,14 +1537,15 @@ class Rule34Searcher(loader.Module):
                         supports_streaming=is_video_ext,
                     )
 
-                sent_messages.append(sent_msg)
-                sent_count += 1
-                
-                # Добавляем ID в список недавно показанных
-                if post_id:
-                    recent_ids.append(post_id)
-                
-                logger.debug(f"[Rule34Searcher] Successfully sent post {post_id} ({sent_count}/{count})")
+                if sent_msg is not None:
+                    sent_messages.append(sent_msg)
+                    sent_count += 1
+                    
+                    # Добавляем ID в список недавно показанных
+                    if post_id:
+                        recent_ids.append(post_id)
+                    
+                    logger.debug(f"[Rule34Searcher] Successfully sent post {post_id} ({sent_count}/{count})")
                     
             except Exception as e:
                 # Логируем ошибку для отладки
@@ -1593,7 +1620,8 @@ class Rule34Searcher(loader.Module):
         return re.sub(r"\s+", " ", match.group(1).strip())[:1200]
 
     def _fetch_remote_module_info_sync(self):
-        resp = requests.get(
+        session = getattr(self, "_session", None) or requests
+        resp = session.get(
             self.update_source_url,
             headers={"Cache-Control": "no-cache"},
             params={"t": int(time.time())},
@@ -1714,6 +1742,16 @@ class Rule34Searcher(loader.Module):
         chat_key = str(chat_id)
         
         async with self._spam_lock:
+            # Периодическая очистка от неактивных пользователей и чатов для предотвращения утечки памяти
+            if len(self._spam_events) > 200:
+                expired_users = [k for k, q in self._spam_events.items() if not q or current_time - q[-1] > self.SPAM_WINDOW]
+                for k in expired_users:
+                    del self._spam_events[k]
+            if len(self._chat_spam_events) > 50:
+                expired_chats = [k for k, q in self._chat_spam_events.items() if not q or current_time - q[-1] > self.GLOBAL_WINDOW]
+                for k in expired_chats:
+                    del self._chat_spam_events[k]
+
             if self._is_spam_blocked(self._chat_spam_blocks, chat_key, current_time):
                 return True
             if self._is_spam_blocked(self._spam_blocks, user_key, current_time):
@@ -1881,22 +1919,25 @@ class Rule34Searcher(loader.Module):
             if not self.config["triggers_enabled"]:
                 return
             
-            if not message.text:
+            raw_text = getattr(message, "raw_text", None) or getattr(message, "text", None) or ""
+            if not raw_text:
                 return
             
-            # Игнорируем команды
-            if message.text.startswith("."):
+            # Игнорируем команды юзербота
+            prefix = self.get_prefix() if hasattr(self, "get_prefix") else "."
+            if raw_text.startswith(prefix) or raw_text.startswith("."):
                 return
             
             # Игнорируем свои сообщения
-            if message.out:
+            if getattr(message, "out", False):
                 return
             
             # Проверяем вайтлист чатов
             if not self._is_chat_allowed(message.peer_id):
                 return
             
-            text_lower = message.text.lower()
+            text_stripped = raw_text.strip()
+            text_lower = text_stripped.lower()
             
             # Проверяем триггер-слова в определенном порядке
             # Сначала проверяем "порно" (чтобы не путалось с другими)
@@ -1915,29 +1956,25 @@ class Rule34Searcher(loader.Module):
                 return
 
             # «r34 теги [кол-во]» — как команда .r34
-            r34_match = re.match(r"^r34\s+(.+)$", message.text.strip(), re.IGNORECASE)
+            r34_match = RE_R34.match(text_stripped)
             if r34_match:
                 await self._search_and_send_r34_chat(message, r34_match.group(1))
                 return
 
             # «pixivnsfw теги [кол-во]» — R-18 Pixiv
-            pixiv_nsfw_match = re.match(
-                r"^pixivnsfw\s+(.+)$", message.text.strip(), re.IGNORECASE
-            )
+            pixiv_nsfw_match = RE_PIXIV_NSFW.match(text_stripped)
             if pixiv_nsfw_match:
                 await self._search_and_send_pixiv_nsfw_chat(message, pixiv_nsfw_match.group(1))
                 return
 
             # «pixivmanga теги» — манга
-            pixiv_manga_match = re.match(
-                r"^pixivmanga\s+(.+)$", message.text.strip(), re.IGNORECASE
-            )
+            pixiv_manga_match = RE_PIXIV_MANGA.match(text_stripped)
             if pixiv_manga_match:
                 await self._send_pixiv_manga_chat(message, pixiv_manga_match.group(1))
                 return
 
             # «pixiv теги [кол-во]» — как команда .pixiv
-            pixiv_match = re.match(r"^pixiv\s+(.+)$", message.text.strip(), re.IGNORECASE)
+            pixiv_match = RE_PIXIV.match(text_stripped)
             if pixiv_match:
                 await self._search_and_send_pixiv_chat(message, pixiv_match.group(1))
                 return
